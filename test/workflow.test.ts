@@ -49,7 +49,7 @@ test("parallel() is a barrier and maps failures to null", async () => {
     undefined,
     h,
   );
-  assert.deepEqual(result, ["a", null, "c"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), ["a", null, "c"]);
 });
 
 test("pipeline() runs stages per item without a barrier; stage errors drop to null", async () => {
@@ -61,7 +61,7 @@ test("pipeline() runs stages per item without a barrier; stage errors drop to nu
     undefined,
     h,
   );
-  assert.deepEqual(result, [10, null, 32]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), [10, null, 32]);
 });
 
 test("phase() and log()/console.log reach the hooks", async () => {
@@ -127,7 +127,10 @@ test("CC-style script with meta runs", async () => {
     undefined,
     h,
   );
-  assert.deepEqual(result, { count: 2 });
+  // Objects returned from the vm belong to another realm (different
+  // Object.prototype) — JSON-normalize before comparing, exactly like the
+  // extension does before persisting results.
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), { count: 2 });
 });
 
 function run(overrides: Partial<WorkflowRun> = {}): WorkflowRun {
