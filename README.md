@@ -21,7 +21,20 @@ return { findings: verified.filter(Boolean) };
 
 ## The contract
 
-- **Globals**: `agent(prompt, {agent?, label?, phase?})` → child's report or `null`; `parallel(thunks)` (barrier, failures → null); `pipeline(items, ...stages)` (no barrier between stages); `phase(title)`; `log(msg)`; `args`. The script's return value is the tool result.
+- **Structured output** (v0.3): `agent(prompt, { schema })` makes the child answer with data and resolves the **validated object** instead of prose — no more parsing reports in the script. A mismatch buys exactly one retry, with the validation errors handed back to the child; if it still fails, the call returns `null` like any other failure. This is load-bearing rather than decorative: in a live run against GPT-5.6 the first answer was prose and the retry produced a clean object.
+
+```js
+const REVIEW = { type: "object", required: ["findings"], properties: {
+  findings: { type: "array", maxItems: 3, items: { type: "object",
+    required: ["file", "severity"],
+    properties: { file: { type: "string" }, severity: { type: "string", enum: ["low", "high"] } } } } } };
+const review = await agent("Review src/auth for security issues.", { schema: REVIEW });
+const high = review.findings.filter((f) => f.severity === "high");   // a real array
+```
+
+The supported subset is the part of JSON Schema workflow authors actually write — `type` (incl. `integer`/`null`), `properties`, `required`, `items`, `enum`, `minItems`/`maxItems`, `minimum`/`maximum`, `minLength`/`maxLength`. Keywords outside it are ignored rather than rejected, so a richer schema still works, just with less checking.
+
+- **Globals**: `agent(prompt, {agent?, label?, phase?, gate?, isolation?, schema?})` → child's report, structured object, or `null`; `parallel(thunks)` (barrier, failures → null); `pipeline(items, ...stages)` (no barrier between stages); `phase(title)`; `log(msg)`; `args`. The script's return value is the tool result.
 - **Determinism enforced** in a poisoned `node:vm` context: `Date.now()`, `Math.random()`, argless `new Date()`, `eval`, and `Function` throw — control flow stays reproducible. (Cooperative discipline, not a security boundary: scripts run at the same trust level as the bash tool.)
 - **One agent catalog**: `agent()` uses the same `reviewer`/`scout`/`worker` builtins and `.pi/agents/*.md` custom types as [`@pify/subagent`](https://github.com/pifydev/subagent) and [`@pify/swarm`](https://github.com/pifydev/swarm).
 - **Limits**: 20 agents per run, 4 concurrent (shared semaphore), 10-minute script timeout.

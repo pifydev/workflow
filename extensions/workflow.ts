@@ -36,6 +36,7 @@ import { createIsolationWorktree, isolationNote, type Isolation } from "../src/i
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import { runScript, type AgentOptions } from "../src/sandbox.ts";
+import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
   MAX_PERSISTED_RESULT_CHARS,
@@ -150,7 +151,7 @@ export default function workflow(pi: ExtensionAPI) {
     run: WorkflowRun,
     prompt: string,
     opts: AgentOptions | undefined,
-  ): Promise<string | null> {
+  ): Promise<unknown> {
     const def = defs.get((opts?.agent ?? FALLBACK_AGENT).toLowerCase()) ?? defs.get(FALLBACK_AGENT);
     if (!def) return null;
 
@@ -207,6 +208,7 @@ export default function workflow(pi: ExtensionAPI) {
             ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
             def.systemPrompt,
             "You are one step of a scripted workflow. Your final assistant message IS the value returned to the script — return raw data/report, no pleasantries, no questions.",
+            ...(opts?.schema ? [schemaInstruction(opts.schema)] : []),
           ],
         }),
       });
@@ -224,25 +226,65 @@ export default function workflow(pi: ExtensionAPI) {
 
       await session.prompt(prompt, { source: "extension" } as never);
 
-      const messages = session.messages as Array<{
-        role?: string;
-        stopReason?: unknown;
-        content?: Array<{ type?: string; text?: string }>;
-      }>;
-      const last = [...messages].reverse().find((m) => m.role === "assistant");
-      const text = (last?.content ?? [])
-        .filter((c) => c.type === "text" && typeof c.text === "string")
-        .map((c) => c.text)
-        .join("\n")
-        .trim();
+      /** Text of the newest assistant message, with its stop reason. */
+      const lastAnswer = () => {
+        const messages = session!.messages as Array<{
+          role?: string;
+          stopReason?: unknown;
+          content?: Array<{ type?: string; text?: string }>;
+        }>;
+        const last = [...messages].reverse().find((m) => m.role === "assistant");
+        return {
+          stopReason: last?.stopReason,
+          text: (last?.content ?? [])
+            .filter((c) => c.type === "text" && typeof c.text === "string")
+            .map((c) => c.text)
+            .join("\n")
+            .trim(),
+        };
+      };
 
-      if (last?.stopReason === "aborted") {
+      let { stopReason, text } = lastAnswer();
+
+      if (stopReason === "aborted") {
         call.status = "aborted";
         return text || null;
       }
-      if (last?.stopReason === "error" || !text) {
+      if (stopReason === "error" || !text) {
         call.status = "error";
         return null;
+      }
+
+      // v0.3 schema: the script asked for data, so hand it data. One retry
+      // with the validation errors — models fix their own shape far more
+      // reliably than a second model can guess what was meant.
+      if (opts?.schema) {
+        let outcome = readStructured(text, opts.schema);
+        if (!outcome.ok) {
+          run.logs.push(`${call.label}: schema mismatch, retrying (${outcome.errors[0] ?? "invalid"})`);
+          renderWidget();
+          await session.prompt(retryPrompt(outcome.errors, opts.schema), { source: "extension" } as never);
+          ({ text } = lastAnswer());
+          outcome = readStructured(text, opts.schema);
+        }
+        if (!outcome.ok) {
+          call.status = "error";
+          run.logs.push(`${call.label}: schema still unmet — ${outcome.errors.slice(0, 2).join("; ")}`);
+          renderWidget();
+          return null;
+        }
+        if (opts.gate) {
+          const gate = runGate(opts.gate, workDir);
+          if (!gate.ok) {
+            call.status = "error";
+            run.logs.push(`gate failed for ${call.label}: ${gate.output.slice(0, 200)}`);
+            renderWidget();
+            return null;
+          }
+        }
+        call.status = "done";
+        // Structured results cross the vm boundary as plain data.
+        return JSON.parse(JSON.stringify(outcome.value)) as unknown;
       }
 
       // v0.2 gate: verify the child's work by running a command instead of
@@ -331,14 +373,16 @@ export default function workflow(pi: ExtensionAPI) {
     label: "Run workflow",
     description:
       "Run a deterministic JavaScript orchestration script that fans work out across child agents. " +
-      "Globals: agent(prompt, {agent?, label?, phase?, gate?, isolation?}) -> Promise<string|null> (agent types: " +
+      "Globals: agent(prompt, {agent?, label?, phase?, gate?, isolation?, schema?}) -> Promise<string|object|null> (agent types: " +
       "reviewer/scout/worker + .pi/agents custom; write prompts as self-contained briefs); " +
       "parallel(thunks) (barrier, failures resolve null); pipeline(items, ...stages) (no barrier " +
       "between stages); phase(title); log(msg); args. The script's return value is the tool result. " +
       "Date.now()/Math.random()/eval throw (determinism). Provide script XOR name " +
       "(name loads .pi/workflows/<name>.js). background=true returns a runId for workflow_status. " +
       "agent() extras: gate=shell command run after the child (non-zero exit fails the call); " +
-      "isolation=worktree runs the child in its own git worktree for mutating steps.",
+      "isolation=worktree runs the child in its own git worktree for mutating steps; " +
+      "schema=<JSON Schema> makes the child answer with data — agent() then resolves the validated object " +
+      "(one retry on mismatch, null if it still fails), so scripts never parse prose.",
     parameters: Type.Object({
       script: Type.Optional(Type.String({ description: "JavaScript orchestration script body" })),
       name: Type.Optional(Type.String({ description: "Saved workflow name in .pi/workflows/" })),

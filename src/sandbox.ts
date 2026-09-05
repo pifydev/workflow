@@ -19,11 +19,16 @@ export interface AgentOptions {
   gate?: string;
   /** "worktree": run the child in an isolated git worktree (v0.2). */
   isolation?: string;
+  /** JSON Schema: the child answers with data, agent() resolves an object (v0.3). */
+  schema?: Record<string, unknown>;
 }
 
 export interface SandboxHooks {
-  /** Spawn one child agent; resolves to its report text or null on failure. */
-  agent(prompt: string, opts?: AgentOptions): Promise<string | null>;
+  /**
+   * Spawn one child agent. Resolves to its report text, or — when a schema
+   * was given — the validated object; null on failure.
+   */
+  agent(prompt: string, opts?: AgentOptions): Promise<unknown>;
   log(message: string): void;
   phase(title: string): void;
 }
@@ -79,7 +84,7 @@ export async function runScript(
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   let agentCalls = 0;
 
-  const agent = (prompt: unknown, opts?: AgentOptions): Promise<string | null> => {
+  const agent = (prompt: unknown, opts?: AgentOptions): Promise<unknown> => {
     if (typeof prompt !== "string" || !prompt.trim()) {
       throw new Error("agent() requires a non-empty prompt string.");
     }
