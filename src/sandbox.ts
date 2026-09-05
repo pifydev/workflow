@@ -15,6 +15,10 @@ export interface AgentOptions {
   agent?: string;
   label?: string;
   phase?: string;
+  /** Shell command run after the child finishes; non-zero exit → result null (v0.2). */
+  gate?: string;
+  /** "worktree": run the child in an isolated git worktree (v0.2). */
+  isolation?: string;
 }
 
 export interface SandboxHooks {

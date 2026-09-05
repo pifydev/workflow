@@ -29,7 +29,10 @@ import { Type } from "typebox";
 import { readFileSync, readdirSync } from "node:fs";
 import { basename, join } from "node:path";
 
+import { spawnSync } from "node:child_process";
+
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { createIsolationWorktree, isolationNote, type Isolation } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import { runScript, type AgentOptions } from "../src/sandbox.ts";
@@ -44,6 +47,28 @@ import {
 
 const RUN_ENTRY = "workflow-run";
 const FALLBACK_AGENT = "scout";
+const GATE_TIMEOUT_MS = 120_000;
+
+/**
+ * Run a gate command with the shell in the child's working directory.
+ * Gate commands come from the workflow script — the same trust level as the
+ * bash tool in this session.
+ */
+function runGate(command: string, cwd: string): { ok: boolean; output: string } {
+  try {
+    const result = spawnSync(command, {
+      shell: true,
+      cwd,
+      encoding: "utf8",
+      timeout: GATE_TIMEOUT_MS,
+      windowsHide: true,
+    });
+    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
+    return { ok: result.status === 0, output };
+  } catch (err) {
+    return { ok: false, output: err instanceof Error ? err.message : String(err) };
+  }
+}
 
 type UiContext = ExtensionContext;
 
@@ -154,18 +179,25 @@ export default function workflow(pi: ExtensionAPI) {
       }
       if (!model) throw new Error("No model available");
 
+      // v0.2: worktree isolation for mutating steps.
+      let isolation: Isolation | null = null;
+      if (opts?.isolation === "worktree") {
+        isolation = createIsolationWorktree(ctx.cwd, `${run.runId}-${call.label}`);
+      }
+      const workDir = isolation?.path ?? ctx.cwd;
+
       const promptHost = ctx as unknown as {
         getSystemPromptOptions?: () => { customPrompt?: string; appendSystemPrompt?: string };
       };
       const promptOptions = promptHost.getSystemPromptOptions?.() ?? {};
 
       const created = await createAgentSession({
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager: SessionManager.inMemory(workDir),
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
         tools: def.tools,
         resourceLoader: new DefaultResourceLoader({
-          cwd: ctx.cwd,
+          cwd: workDir,
           agentDir: getAgentDir(),
           noExtensions: true,
           noPromptTemplates: true,
@@ -212,8 +244,22 @@ export default function workflow(pi: ExtensionAPI) {
         call.status = "error";
         return null;
       }
+
+      // v0.2 gate: verify the child's work by running a command instead of
+      // asking another model (tintinweb). Non-zero exit fails the call.
+      if (opts?.gate) {
+        const gate = runGate(opts.gate, workDir);
+        if (!gate.ok) {
+          call.status = "error";
+          run.logs.push(`gate failed for ${call.label}: ${gate.output.slice(0, 200)}`);
+          renderWidget();
+          return null;
+        }
+        run.logs.push(`gate passed for ${call.label}`);
+      }
+
       call.status = "done";
-      return text;
+      return isolation ? `${text}\n\n${isolationNote(isolation)}` : text;
     } catch {
       call.status = "error";
       return null;
@@ -285,12 +331,14 @@ export default function workflow(pi: ExtensionAPI) {
     label: "Run workflow",
     description:
       "Run a deterministic JavaScript orchestration script that fans work out across child agents. " +
-      "Globals: agent(prompt, {agent?, label?, phase?}) -> Promise<string|null> (agent types: " +
+      "Globals: agent(prompt, {agent?, label?, phase?, gate?, isolation?}) -> Promise<string|null> (agent types: " +
       "reviewer/scout/worker + .pi/agents custom; write prompts as self-contained briefs); " +
       "parallel(thunks) (barrier, failures resolve null); pipeline(items, ...stages) (no barrier " +
       "between stages); phase(title); log(msg); args. The script's return value is the tool result. " +
       "Date.now()/Math.random()/eval throw (determinism). Provide script XOR name " +
-      "(name loads .pi/workflows/<name>.js). background=true returns a runId for workflow_status.",
+      "(name loads .pi/workflows/<name>.js). background=true returns a runId for workflow_status. " +
+      "agent() extras: gate=shell command run after the child (non-zero exit fails the call); " +
+      "isolation=worktree runs the child in its own git worktree for mutating steps.",
     parameters: Type.Object({
       script: Type.Optional(Type.String({ description: "JavaScript orchestration script body" })),
       name: Type.Optional(Type.String({ description: "Saved workflow name in .pi/workflows/" })),
