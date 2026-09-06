@@ -45,6 +45,7 @@ import {
   type AgentDef,
   type WorkflowRun,
 } from "../src/types.ts";
+import { ResumeCursor, buildCache, callKey, resumeSummary } from "../src/resume.ts";
 
 const RUN_ENTRY = "workflow-run";
 const FALLBACK_AGENT = "scout";
@@ -146,7 +147,52 @@ export default function workflow(pi: ExtensionAPI) {
     if (next) next();
   }
 
+  /**
+   * One agent call, with the resume cache in front of it. The cursor hands
+   * back the prior run's result while the calls still match; the first
+   * difference ends the cache and everything after it runs live.
+   */
   async function runChildAgent(
+    ctx: UiContext,
+    run: WorkflowRun,
+    cursor: ResumeCursor | null,
+    prompt: string,
+    opts: AgentOptions | undefined,
+  ): Promise<unknown> {
+    const key = callKey(prompt, opts as Record<string, unknown> | undefined);
+    if (cursor) {
+      const cached = cursor.next(key);
+      if (cached.hit) {
+        const def = defs.get((opts?.agent ?? FALLBACK_AGENT).toLowerCase()) ?? defs.get(FALLBACK_AGENT);
+        run.agents.push({
+          id: run.agents.length + 1,
+          label: opts?.label ?? `${def?.name ?? FALLBACK_AGENT}-${run.agents.length + 1}`,
+          agent: def?.name ?? FALLBACK_AGENT,
+          phase: opts?.phase ?? (run.phases[run.phases.length - 1] ?? null),
+          status: "done",
+          turns: 0,
+          tokens: 0,
+          key,
+          result: cached.value,
+          cached: true,
+        });
+        renderWidget();
+        return cached.value;
+      }
+    }
+    // The spawner pushes its call state synchronously, so this index is the
+    // entry it will use.
+    const index = run.agents.length;
+    const value = await spawnChildAgent(ctx, run, prompt, opts);
+    const call = run.agents[index];
+    if (call) {
+      call.key = key;
+      if (call.status === "done") call.result = value;
+    }
+    return value;
+  }
+
+  async function spawnChildAgent(
     ctx: UiContext,
     run: WorkflowRun,
     prompt: string,
@@ -327,10 +373,16 @@ export default function workflow(pi: ExtensionAPI) {
 
   // ── Execution ────────────────────────────────────────────────────────
 
-  async function execute(ctx: UiContext, run: WorkflowRun, script: string, args: unknown): Promise<void> {
+  async function execute(
+    ctx: UiContext,
+    run: WorkflowRun,
+    script: string,
+    args: unknown,
+    cursor: ResumeCursor | null = null,
+  ): Promise<void> {
     try {
       const value = await runScript(script, args, {
-        agent: (prompt, opts) => runChildAgent(ctx, run, prompt, opts),
+        agent: (prompt, opts) => runChildAgent(ctx, run, cursor, prompt, opts),
         log: (message) => {
           run.logs.push(message.slice(0, 500));
           renderWidget();
@@ -382,16 +434,27 @@ export default function workflow(pi: ExtensionAPI) {
       "agent() extras: gate=shell command run after the child (non-zero exit fails the call); " +
       "isolation=worktree runs the child in its own git worktree for mutating steps; " +
       "schema=<JSON Schema> makes the child answer with data — agent() then resolves the validated object " +
-      "(one retry on mismatch, null if it still fails), so scripts never parse prose.",
+      "(one retry on mismatch, null if it still fails), so scripts never parse prose. " +
+      "resumeFromRunId replays a prior run's agent results for as long as the calls match, then runs live — " +
+      "edit a script and re-run it without paying for the steps that did not change.",
     parameters: Type.Object({
       script: Type.Optional(Type.String({ description: "JavaScript orchestration script body" })),
       name: Type.Optional(Type.String({ description: "Saved workflow name in .pi/workflows/" })),
       args: Type.Optional(Type.Unknown({ description: "Value exposed to the script as `args`" })),
       background: Type.Optional(Type.Boolean()),
+      resumeFromRunId: Type.Optional(
+        Type.String({ description: "Reuse a prior run's agent results for the unchanged prefix" }),
+      ),
     }),
     async execute(
       _id,
-      params: { script?: string; name?: string; args?: unknown; background?: boolean },
+      params: {
+        script?: string;
+        name?: string;
+        args?: unknown;
+        background?: boolean;
+        resumeFromRunId?: string;
+      },
       _signal,
       _onUpdate,
       ctx,
@@ -423,9 +486,26 @@ export default function workflow(pi: ExtensionAPI) {
       }
       if (!script.trim()) throw new Error("workflow requires a script (or a saved name).");
 
+      // v0.4 resume: rebuild the prior run's reusable prefix.
+      let cursor: ResumeCursor | null = null;
+      let cacheSize = 0;
+      const resumeId = params.resumeFromRunId?.trim();
+      if (resumeId) {
+        const prior = runs.get(resumeId);
+        if (!prior) {
+          throw new Error(
+            `No run "${resumeId}" in this session. Known runs: ${[...runs.keys()].join(", ") || "(none)"}`,
+          );
+        }
+        const cache = buildCache(prior.agents);
+        cacheSize = cache.length;
+        cursor = new ResumeCursor(cache);
+      }
+
       runCounter++;
       const run: WorkflowRun = {
         runId: `w${runCounter}`,
+        ...(resumeId ? { resumedFrom: resumeId } : {}),
         background: params.background === true,
         status: "running",
         startedAt: Date.now(),
@@ -440,8 +520,10 @@ export default function workflow(pi: ExtensionAPI) {
       activeRun = run;
       renderWidget(uiCtx);
 
+      if (cursor) run.logs.push(`resume: ${cacheSize} cached agent result(s) available from ${resumeId}`);
+
       if (run.background) {
-        void execute(uiCtx, run, script, params.args).then(() => {
+        void execute(uiCtx, run, script, params.args, cursor).then(() => {
           notify(uiCtx, `workflow ${run.runId}: ${run.status}`, run.status === "done" ? "info" : "warning");
         });
         return {
@@ -450,10 +532,17 @@ export default function workflow(pi: ExtensionAPI) {
         };
       }
 
-      await execute(uiCtx, run, script, params.args);
+      await execute(uiCtx, run, script, params.args, cursor);
+      const resumeNote = cursor ? `
+${resumeSummary(cursor.reused, cacheSize)}` : "";
       return {
-        content: [{ type: "text", text: formatResult(run) }],
-        details: { runId: run.runId, status: run.status, agents: run.agents.length },
+        content: [{ type: "text", text: `${formatResult(run)}${resumeNote}` }],
+        details: {
+          runId: run.runId,
+          status: run.status,
+          agents: run.agents.length,
+          ...(cursor ? { resumedFrom: resumeId, reused: cursor.reused } : {}),
+        },
       };
     },
   });

@@ -59,12 +59,20 @@ export interface AgentCallState {
   status: AgentCallStatus;
   turns: number;
   tokens: number;
+  /** Identity of the call (prompt + options), for resume (v0.4). */
+  key?: string;
+  /** What the call returned, replayed on resume. */
+  result?: unknown;
+  /** True when this result came from a prior run instead of a model. */
+  cached?: boolean;
 }
 
 export type RunStatus = "running" | "done" | "error";
 
 export interface WorkflowRun {
   runId: string;
+  /** Run this one resumed from, when it did (v0.4). */
+  resumedFrom?: string;
   background: boolean;
   status: RunStatus;
   startedAt: number;

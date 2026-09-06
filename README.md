@@ -34,6 +34,10 @@ const high = review.findings.filter((f) => f.severity === "high");   // a real a
 
 The supported subset is the part of JSON Schema workflow authors actually write — `type` (incl. `integer`/`null`), `properties`, `required`, `items`, `enum`, `minItems`/`maxItems`, `minimum`/`maximum`, `minLength`/`maxLength`. Keywords outside it are ignored rather than rejected, so a richer schema still works, just with less checking.
 
+- **Resume** (v0.4): `workflow_run({ script, resumeFromRunId: "w3" })` replays the previous run's agent results for as long as the calls match — same prompt, same options, same position — and runs live from the first difference onward. Editing the last stage of a five-stage workflow costs one stage, not five.
+
+  It is a prefix, not a lookup table, and that is deliberate: a workflow's later prompts are built from earlier results, so once one step's answer changes, every downstream call is potentially different even when its text happens to match. Only calls that finished with a recorded result are reusable; a failed or aborted step always runs again. Runs are replayed from the session file, so a resume still works after `/reload`.
+
 - **Globals**: `agent(prompt, {agent?, label?, phase?, gate?, isolation?, schema?})` → child's report, structured object, or `null`; `parallel(thunks)` (barrier, failures → null); `pipeline(items, ...stages)` (no barrier between stages); `phase(title)`; `log(msg)`; `args`. The script's return value is the tool result.
 - **Determinism enforced** in a poisoned `node:vm` context: `Date.now()`, `Math.random()`, argless `new Date()`, `eval`, and `Function` throw — control flow stays reproducible. (Cooperative discipline, not a security boundary: scripts run at the same trust level as the bash tool.)
 - **One agent catalog**: `agent()` uses the same `reviewer`/`scout`/`worker` builtins and `.pi/agents/*.md` custom types as [`@pify/subagent`](https://github.com/pifydev/subagent) and [`@pify/swarm`](https://github.com/pifydev/swarm).
