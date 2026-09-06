@@ -32,7 +32,12 @@ import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
-import { createIsolationWorktree, isolationNote, type Isolation } from "../src/isolate.ts";
+import {
+  createIsolationWorktree,
+  isolationNote,
+  removeIfUnchanged,
+  type Isolation,
+} from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import { runScript, type AgentOptions } from "../src/sandbox.ts";
@@ -48,6 +53,8 @@ import {
 import { ResumeCursor, buildCache, callKey, resumeSummary } from "../src/resume.ts";
 
 const RUN_ENTRY = "workflow-run";
+const CLEAN_WORKTREE_NOTE =
+  "Ran isolated in a temporary worktree; it changed nothing, so the worktree was removed.";
 const FALLBACK_AGENT = "scout";
 const GATE_TIMEOUT_MS = 120_000;
 
