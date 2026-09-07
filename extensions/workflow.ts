@@ -50,6 +50,13 @@ import {
   type AgentDef,
   type WorkflowRun,
 } from "../src/types.ts";
+import {
+  contractProblems,
+  evaluateGate,
+  normalizeGate,
+  type GateContract,
+  type GateVerdict,
+} from "../src/gate.ts";
 import { ResumeCursor, buildCache, callKey, resumeSummary } from "../src/resume.ts";
 
 const RUN_ENTRY = "workflow-run";
@@ -63,19 +70,44 @@ const GATE_TIMEOUT_MS = 120_000;
  * Gate commands come from the workflow script — the same trust level as the
  * bash tool in this session.
  */
-function runGate(command: string, cwd: string): { ok: boolean; output: string } {
+/**
+ * Run a gate and judge it against its contract. A bare string keeps the old
+ * exit-code meaning; a contract can also say what success has to look like,
+ * which is what stops a command that never ran the check from passing.
+ */
+function runGate(gate: string | GateContract, cwd: string): GateVerdict & { output: string } {
+  const contract = normalizeGate(gate);
+  const problems = contractProblems(contract);
+  if (problems.length > 0) {
+    return { outcome: "failure", ok: false, reason: problems.join("; "), output: "" };
+  }
+  const timeoutMs = contract.timeoutMs ?? GATE_TIMEOUT_MS;
   try {
-    const result = spawnSync(command, {
+    const result = spawnSync(contract.command, {
       shell: true,
       cwd,
       encoding: "utf8",
-      timeout: GATE_TIMEOUT_MS,
+      timeout: timeoutMs,
       windowsHide: true,
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-    return { ok: result.status === 0, output };
+    const verdict = evaluateGate(
+      { ...contract, timeoutMs },
+      {
+        status: result.status,
+        signal: result.signal,
+        output,
+        timedOut: result.error?.message?.includes("ETIMEDOUT") || result.signal === "SIGTERM",
+      },
+    );
+    return { ...verdict, output };
   } catch (err) {
-    return { ok: false, output: err instanceof Error ? err.message : String(err) };
+    return {
+      outcome: "failure",
+      ok: false,
+      reason: err instanceof Error ? err.message : String(err),
+      output: "",
+    };
   }
 }
 
@@ -330,7 +362,7 @@ export default function workflow(pi: ExtensionAPI) {
           const gate = runGate(opts.gate, workDir);
           if (!gate.ok) {
             call.status = "error";
-            run.logs.push(`gate failed for ${call.label}: ${gate.output.slice(0, 200)}`);
+            run.logs.push(`gate ${gate.outcome} for ${call.label}: ${gate.reason}${gate.output ? ` — ${gate.output.slice(0, 160)}` : ""}`);
             renderWidget();
             return null;
           }
@@ -350,7 +382,7 @@ export default function workflow(pi: ExtensionAPI) {
           renderWidget();
           return null;
         }
-        run.logs.push(`gate passed for ${call.label}`);
+        run.logs.push(`gate passed for ${call.label} (${gate.reason})`);
       }
 
       call.status = "done";
@@ -438,7 +470,9 @@ export default function workflow(pi: ExtensionAPI) {
       "between stages); phase(title); log(msg); args. The script's return value is the tool result. " +
       "Date.now()/Math.random()/eval throw (determinism). Provide script XOR name " +
       "(name loads .pi/workflows/<name>.js). background=true returns a runId for workflow_status. " +
-      "agent() extras: gate=shell command run after the child (non-zero exit fails the call); " +
+      "agent() extras: gate=shell command run after the child (non-zero exit fails the call), or " +
+      "gate={command, expect, failure, timeoutMs} so a command that exits 0 without printing the " +
+      "expected evidence fails as result_missing instead of passing; " +
       "isolation=worktree runs the child in its own git worktree for mutating steps; " +
       "schema=<JSON Schema> makes the child answer with data — agent() then resolves the validated object " +
       "(one retry on mismatch, null if it still fails), so scripts never parse prose. " +

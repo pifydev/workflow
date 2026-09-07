@@ -34,6 +34,14 @@ const high = review.findings.filter((f) => f.severity === "high");   // a real a
 
 The supported subset is the part of JSON Schema workflow authors actually write — `type` (incl. `integer`/`null`), `properties`, `required`, `items`, `enum`, `minItems`/`maxItems`, `minimum`/`maximum`, `minLength`/`maxLength`. Keywords outside it are ignored rather than rejected, so a richer schema still works, just with less checking.
 
+- **A gate can say what success looks like** (v0.6): `gate: "bun test"` still passes on exit 0, but `gate: { command: "bun test", expect: "[0-9]+ pass" }` also requires the evidence. A command that never ran the check — a mistyped script under `sh -c`, a runner that matched no tests, a stray `|| true` — exits 0 and now fails as **`result_missing`** instead of certifying the step. A `failure` pattern beats a zero exit, and a killed run reports `timeout` rather than a generic failure, so the log says which of the four things happened. (Vocabulary from [`pi-monitor`](https://github.com/FradSer/pi-packages/tree/main/packages/monitor)'s result contract.)
+
+  ```js
+  await agent("Fix the failing test.", {
+    gate: { command: "bun test", expect: "0 fail", failure: "error TS", timeoutMs: 120000 },
+  })
+  ```
+
 - **Resume** (v0.4): `workflow_run({ script, resumeFromRunId: "w3" })` replays the previous run's agent results for as long as the calls match — same prompt, same options, same position — and runs live from the first difference onward. Editing the last stage of a five-stage workflow costs one stage, not five.
 
   It is a prefix, not a lookup table, and that is deliberate: a workflow's later prompts are built from earlier results, so once one step's answer changes, every downstream call is potentially different even when its text happens to match. Only calls that finished with a recorded result are reusable; a failed or aborted step always runs again. Runs are replayed from the session file, so a resume still works after `/reload`.

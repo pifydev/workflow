@@ -15,8 +15,13 @@ export interface AgentOptions {
   agent?: string;
   label?: string;
   phase?: string;
-  /** Shell command run after the child finishes; non-zero exit → result null (v0.2). */
-  gate?: string;
+  /**
+   * Verification run after the child finishes. A string is the command and
+   * the contract is its exit code; an object may also state what success has
+   * to look like, so a command that exits 0 without doing the check fails as
+   * `result_missing` instead of passing (v0.6).
+   */
+  gate?: string | { command: string; expect?: string; failure?: string; timeoutMs?: number };
   /** "worktree": run the child in an isolated git worktree (v0.2). */
   isolation?: string;
   /** JSON Schema: the child answers with data, agent() resolves an object (v0.3). */
