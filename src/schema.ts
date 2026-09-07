@@ -129,11 +129,64 @@ export function validateAgainstSchema(value: unknown, schema: JsonSchema, path =
   return errors;
 }
 
+/**
+ * A validation failure the child can act on: what to change, what proved it
+ * wrong, and which repairs are legitimate.
+ *
+ * A bare list of messages leaves the model guessing at the repair space, and
+ * a guessing model rewrites the parts that were already right. Naming the
+ * subject and bounding the fixes is tt-a1i/archify's diagnostic shape
+ * (subject / evidence / supportedFixes), and it costs nothing to carry.
+ */
+export interface Diagnostic {
+  /** Dotted path of the offending value, e.g. "root.findings[2].file". */
+  subject: string;
+  /** The validator's own words for what is wrong. */
+  evidence: string;
+  /** Repairs that would satisfy the schema. */
+  supportedFixes: string[];
+}
+
+/** Turn a validator message back into the parts a repair needs. */
+export function toDiagnostic(message: string): Diagnostic {
+  const subject = /^(\S+?)\s/.exec(message)?.[1] ?? "root";
+  const rest = message.slice(subject.length).trim();
+  const fixes: string[] = [];
+
+  const listed = /must be one of (.+?), got|must be one of (.+)$/.exec(rest);
+  const candidates = (listed?.[1] ?? listed?.[2] ?? "").trim();
+  // "string|number" is a union of types; '"low", "high"' is a set of values.
+  // They read the same in the message and need different repairs.
+  const isTypeUnion = candidates.includes("|") && !candidates.includes('"');
+  const typeMatch = /must be ([\w|]+), got (\w+)/.exec(rest);
+  if (/is required$/.test(rest)) {
+    fixes.push(`add ${subject}`);
+  } else if (isTypeUnion) {
+    fixes.push(`make ${subject} a ${candidates.replace(/\|/g, " or ")}`);
+  } else if (typeMatch) {
+    fixes.push(`make ${subject} a ${typeMatch[1]!.replace(/\|/g, " or ")}`);
+  } else if (candidates) {
+    fixes.push(`set ${subject} to one of ${candidates}`);
+  } else if (/at least|at most|>=|<=/.test(rest)) {
+    fixes.push(`adjust ${subject} so it satisfies: ${rest}`);
+  } else {
+    fixes.push(`correct ${subject}`);
+  }
+  // The repair that is never right, stated because models reach for it.
+  fixes.push("keep every field that already validates unchanged");
+  return { subject, evidence: rest || message, supportedFixes: fixes };
+}
+
 /** The one retry the child gets: what was wrong, and what to send instead. */
 export function retryPrompt(errors: string[], schema: JsonSchema): string {
+  const diagnostics = errors.slice(0, 8).map(toDiagnostic);
   return [
-    "That answer did not match the required schema:",
-    ...errors.slice(0, 8).map((error) => `- ${error}`),
+    "That answer did not match the required schema. Fix exactly these, nothing else:",
+    ...diagnostics.map(
+      (d) => `- subject: ${d.subject}\n  evidence: ${d.evidence}\n  fixes: ${d.supportedFixes.join("; ")}`,
+    ),
+    "",
+    "Change one thing per diagnostic. Do not restructure the parts that already validated.",
     "",
     schemaInstruction(schema),
   ].join("\n");

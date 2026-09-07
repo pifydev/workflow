@@ -21,7 +21,7 @@ return { findings: verified.filter(Boolean) };
 
 ## The contract
 
-- **Structured output** (v0.3): `agent(prompt, { schema })` makes the child answer with data and resolves the **validated object** instead of prose — no more parsing reports in the script. A mismatch buys exactly one retry, with the validation errors handed back to the child; if it still fails, the call returns `null` like any other failure. This is load-bearing rather than decorative: in a live run against GPT-5.6 the first answer was prose and the retry produced a clean object.
+- **Structured output** (v0.3): `agent(prompt, { schema })` makes the child answer with data and resolves the **validated object** instead of prose — no more parsing reports in the script. A mismatch buys exactly one retry, and what goes back is a diagnostic rather than a complaint: each failure names the **subject** (the path that is wrong), the **evidence** (what the validator saw), and the **supported fixes** — plus the one instruction that turns out to matter most, *keep every field that already validates unchanged*. Measured against a near-miss answer on openrouter/qwen3-235b, four runs out of four: the old bare error list produced a valid object that had also rewritten the summary and fields nobody complained about; the diagnostic form changed only the invalid field and left the rest byte-identical. If it still fails, the call returns `null` like any other failure. (The subject/evidence/supportedFixes shape is from [`archify`](https://github.com/tt-a1i/archify).) This is load-bearing rather than decorative: in a live run against GPT-5.6 the first answer was prose and the retry produced a clean object.
 
 ```js
 const REVIEW = { type: "object", required: ["findings"], properties: {
