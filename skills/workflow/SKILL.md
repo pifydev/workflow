@@ -39,3 +39,14 @@ Only orchestrate when the structure earns it.
 Reusable scripts live in `.pi/workflows/<name>.js` and run with
 `workflow name="<name>" args={...}`. Prefer a saved script when the user
 runs the same orchestration repeatedly.
+
+## Reporting a run honestly
+
+- A workflow's result is what the script returned, not what you hoped it
+  would do. `status: "error"` and a non-zero `gate` are failures; a non-zero
+  exit can never be described as success.
+- Count before you claim. "3 of 5 agents returned null" is a result the user
+  can act on; "the workflow ran" is not.
+- When a run keeps failing the same way, stop re-running it. Keep iterating
+  only while each attempt reduces the failure count; if two consecutive
+  attempts do not beat the best so far, report the remaining failures.
