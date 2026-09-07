@@ -32,6 +32,7 @@ import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import {
   createIsolationWorktree,
   isolationNote,
@@ -119,6 +120,12 @@ export default function workflow(pi: ExtensionAPI) {
   let activeRun: WorkflowRun | null = null;
   let runCounter = 0;
   let lastUiCtx: UiContext | null = null;
+  /**
+   * Live child sessions per run. A run is a tree of provider connections, and
+   * both "stop" signals — the tool's AbortSignal and session teardown — have
+   * to reach every one of them.
+   */
+  const live = new LiveChildren();
 
   function loadDefs(cwd: string): void {
     defs = new Map();
@@ -164,6 +171,25 @@ export default function workflow(pi: ExtensionAPI) {
 
   function notify(ctx: UiContext, message: string, level: "info" | "warning" | "error"): void {
     if (ctx.hasUI) ctx.ui.notify(message, level);
+  }
+
+  /**
+   * Stop a run and everything it started. Called from the tool's AbortSignal
+   * and from session teardown; both need the children to actually stop, not
+   * just the record to say so.
+   */
+  function cancelRun(run: WorkflowRun, reason: CancelReason): void {
+    const stopped = live.abortRun(run.runId);
+    if (run.status === "running") {
+      run.status = "cancelled";
+      run.finishedAt = Date.now();
+      run.error = cancelNote(reason, stopped);
+      run.logs.push(run.error);
+    }
+    for (const call of run.agents) {
+      if (call.status === "running") call.status = "aborted";
+    }
+    renderWidget();
   }
 
   // ── Child agent runner behind a shared concurrency semaphore ─────────
@@ -237,6 +263,12 @@ export default function workflow(pi: ExtensionAPI) {
     prompt: string,
     opts: AgentOptions | undefined,
   ): Promise<unknown> {
+    // The script keeps running inside the vm after a cancel — it is ordinary
+    // JavaScript and nothing can interrupt it mid-statement. What we can do is
+    // refuse to start anything new, so a cancelled run stops costing money at
+    // the next agent() instead of finishing its whole fan-out.
+    if (run.status === "cancelled") return null;
+
     const def = defs.get((opts?.agent ?? FALLBACK_AGENT).toLowerCase()) ?? defs.get(FALLBACK_AGENT);
     if (!def) return null;
 
@@ -255,6 +287,7 @@ export default function workflow(pi: ExtensionAPI) {
     await acquire();
     let session: AgentSession | null = null;
     let unsubscribe: (() => void) | null = null;
+    let releaseLive: (() => void) | null = null;
     try {
       let model = ctx.model ?? null;
       if (def.model) {
@@ -298,6 +331,7 @@ export default function workflow(pi: ExtensionAPI) {
         }),
       });
       session = created.session;
+      releaseLive = live.register(run.runId, session);
 
       unsubscribe = session.subscribe((event) => {
         if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
@@ -392,6 +426,7 @@ export default function workflow(pi: ExtensionAPI) {
       return null;
     } finally {
       release();
+      if (releaseLive) releaseLive();
       if (unsubscribe) {
         try {
           unsubscribe();
@@ -436,10 +471,15 @@ export default function workflow(pi: ExtensionAPI) {
       if (run.result && run.result.length > MAX_PERSISTED_RESULT_CHARS) {
         run.result = `${run.result.slice(0, MAX_PERSISTED_RESULT_CHARS)}\n… (truncated)`;
       }
-      run.status = "done";
+      // A cancelled run keeps its verdict: the script may have run to the end
+      // of its own code after the children were stopped, and calling that
+      // "done" would report a result nobody produced.
+      if (run.status !== "cancelled") run.status = "done";
     } catch (err) {
-      run.status = "error";
-      run.error = err instanceof Error ? err.message : String(err);
+      if (run.status !== "cancelled") {
+        run.status = "error";
+        run.error = err instanceof Error ? err.message : String(err);
+      }
     } finally {
       run.finishedAt = Date.now();
       pi.appendEntry(RUN_ENTRY, run);
@@ -496,7 +536,7 @@ export default function workflow(pi: ExtensionAPI) {
         background?: boolean;
         resumeFromRunId?: string;
       },
-      _signal,
+      signal,
       _onUpdate,
       ctx,
     ) {
@@ -561,6 +601,19 @@ export default function workflow(pi: ExtensionAPI) {
       activeRun = run;
       renderWidget(uiCtx);
 
+      // Esc has to reach the children, not just this record. A foreground run
+      // stops with the turn; a background one outlives the tool call by
+      // design, so its signal is not its cancel button.
+      let stopListening: (() => void) | null = null;
+      if (signal && !run.background) {
+        const onAbort = () => cancelRun(run, "user-abort");
+        if (signal.aborted) onAbort();
+        else {
+          signal.addEventListener("abort", onAbort, { once: true });
+          stopListening = () => signal.removeEventListener("abort", onAbort);
+        }
+      }
+
       if (cursor) run.logs.push(`resume: ${cacheSize} cached agent result(s) available from ${resumeId}`);
 
       if (run.background) {
@@ -573,7 +626,11 @@ export default function workflow(pi: ExtensionAPI) {
         };
       }
 
-      await execute(uiCtx, run, script, params.args, cursor);
+      try {
+        await execute(uiCtx, run, script, params.args, cursor);
+      } finally {
+        if (stopListening) stopListening();
+      }
       const resumeNote = cursor ? `
 ${resumeSummary(cursor.reused, cacheSize)}` : "";
       return {
@@ -623,6 +680,11 @@ ${resumeSummary(cursor.reused, cacheSize)}` : "";
   });
 
   pi.on("session_shutdown", async (_event, ctx) => {
+    // A run cannot outlive the session that owns it: the conversation it was
+    // writing into is gone, and nobody will ever read the result.
+    for (const run of runs.values()) {
+      if (run.status === "running") cancelRun(run, "session-switch");
+    }
     if (ctx.hasUI) ctx.ui.setWidget("workflow", undefined);
   });
 

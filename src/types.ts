@@ -67,7 +67,12 @@ export interface AgentCallState {
   cached?: boolean;
 }
 
-export type RunStatus = "running" | "done" | "error";
+/**
+ * "cancelled" is its own outcome, not an error: nothing went wrong with the
+ * work, someone stopped it. Reporting it as an error sends the model looking
+ * for a bug that is not there.
+ */
+export type RunStatus = "running" | "done" | "error" | "cancelled";
 
 export interface WorkflowRun {
   runId: string;
