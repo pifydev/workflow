@@ -103,7 +103,7 @@ It is a prefix, not a lookup table, and that is deliberate: a workflow's later p
 - **Isolated steps clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; anything uncommitted, and any commit the child made, is kept and reported.
 - **Limits.** 20 agents per run, 4 concurrent behind a shared semaphore, and a 10-minute script timeout.
 - **Saved workflows.** `.pi/workflows/<name>.js` runs by name. An `export const meta = {…}` prefix is tolerated, so scripts written for other harnesses mostly run unchanged.
-- **Background runs.** `background: true` returns a `runId` to poll with `workflow_status`. A live widget shows the current phase and its agents; finished runs survive `/reload`.
+- **Background runs come back to you.** `background: true` returns a `runId`, and when the run finishes its result is **delivered** into the conversation rather than waiting to be asked for. `workflow_status` still shows the live phase and agent lines, but no longer ends in "poll me again": it returns a structured result with `retryable`, the elapsed time and `pollRequired: false`. Answering "not yet" with a tool *error* would be worse than useless — it invites the model's own retry machinery into a loop over a condition only time resolves. A live widget shows the current phase and its agents; finished runs survive `/reload`.
 
 ## Command
 

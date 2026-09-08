@@ -33,6 +33,7 @@ import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
+import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import {
   createIsolationWorktree,
   isolationNote,
@@ -619,6 +620,21 @@ export default function workflow(pi: ExtensionAPI) {
       if (run.background) {
         void execute(uiCtx, run, script, params.args, cursor).then(() => {
           notify(uiCtx, `workflow ${run.runId}: ${run.status}`, run.status === "done" ? "info" : "warning");
+          // The result goes to the agent, not only to the screen — otherwise
+          // asking again was its only way to find out.
+          try {
+            pi.sendMessage(
+              {
+                customType: DELIVERY_TYPE,
+                content: deliveryMessage(run.runId, "workflow", formatResult(run)),
+                display: true,
+                details: { runId: run.runId, status: run.status, agents: run.agents.length },
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+          } catch {
+            // Delivery is a convenience; workflow_status still works.
+          }
         });
         return {
           content: [{ type: "text", text: `Workflow ${run.runId} started. Poll workflow_status runId="${run.runId}".` }],
@@ -655,8 +671,24 @@ ${resumeSummary(cursor.reused, cacheSize)}` : "";
     async execute(_id, params: { runId?: string }) {
       const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
       if (!run) throw new Error("No workflow runs this session.");
-      const text = run.status === "running" ? formatStatus(run) : formatResult(run);
-      return { content: [{ type: "text", text }], details: { runId: run.runId, status: run.status } };
+      if (run.status === "running") {
+        const pending = pendingResult({
+          id: run.runId,
+          kind: "running",
+          startedAt: run.startedAt,
+          now: Date.now(),
+          collectWith: "workflow_status",
+        });
+        // The live phase/agent lines are still worth having; what changes is
+        // that they no longer end in "poll me again".
+        return {
+          content: [{ type: "text", text: `${formatStatus(run)}
+
+${pending.text}` }],
+          details: pending.details as never,
+        };
+      }
+      return { content: [{ type: "text", text: formatResult(run) }], details: { runId: run.runId, status: run.status } };
     },
   });
 
