@@ -1,4 +1,38 @@
+import { attributionNote } from "./gate.ts";
 import type { ThemeLike, WorkflowRun } from "./types.ts";
+
+/**
+ * What the gates in this run actually proved.
+ *
+ * Without this the result is silent about them. A failed gate makes `agent()`
+ * return `null`, the script's own `.filter(Boolean)` drops it, and the reader
+ * gets a shorter array with no hint that a step was rejected or why — which is
+ * the one thing a gate exists to say. So the reasons travel with the result.
+ *
+ * Compact on purpose: a clean, attributable pass needs no explanation and gets
+ * one word in the tally. Only verdicts that change what the reader should do
+ * spend a line.
+ */
+export function formatGates(run: WorkflowRun): string | null {
+  const gated = run.agents.filter((a) => a.gate);
+  if (gated.length === 0) return null;
+
+  const tally = new Map<string, number>();
+  for (const call of gated) tally.set(call.gate!.outcome, (tally.get(call.gate!.outcome) ?? 0) + 1);
+  const summary = [...tally.entries()].map(([outcome, n]) => `${n} ${outcome}`).join(", ");
+
+  const lines = [`Gates: ${summary}`];
+  for (const call of gated) {
+    const gate = call.gate!;
+    const note = attributionNote(gate);
+    if (gate.ok && !note) continue;
+    lines.push(
+      `  ${gate.ok ? "✓" : "✗"} ${call.label} — ${gate.outcome}: ${gate.reason}` +
+        (note ? `\n      ${note}` : ""),
+    );
+  }
+  return lines.join("\n");
+}
 
 export function formatResult(run: WorkflowRun): string {
   const header = `[workflow ${run.runId}] ${run.status} — ${run.agents.length} agents, ${run.phases.length} phases`;
@@ -6,7 +40,8 @@ export function formatResult(run: WorkflowRun): string {
   if (run.status === "running") {
     return `${header}\nStill running — poll workflow_status runId="${run.runId}".`;
   }
-  return `${header}\n${run.result ?? "(script returned nothing)"}`;
+  const gates = formatGates(run);
+  return [header, gates, run.result ?? "(script returned nothing)"].filter(Boolean).join("\n");
 }
 
 export function formatStatus(run: WorkflowRun): string {

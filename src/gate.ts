@@ -11,9 +11,22 @@
  * So a gate may state what success looks like. When it does, exiting 0
  * without that evidence is its own outcome (`result_missing`) rather than a
  * pass. The vocabulary is FradSer/pi-monitor's result contract.
+ *
+ * The same distinction runs one step further. A check that ran and said no is
+ * evidence; a check that could not run at all is *not evidence of anything*.
+ * A misspelled command, a runner that is not installed, a gate whose own regex
+ * does not compile — none of those are the code failing, and reporting them as
+ * `failure` sends the reader looking for a bug in the work instead of a typo
+ * in the gate. That case is `no_attestation`: still not a pass, but honest
+ * about having proved nothing either way.
  */
 
-export type GateOutcome = "success" | "failure" | "result_missing" | "timeout";
+export type GateOutcome =
+  | "success"
+  | "failure"
+  | "result_missing"
+  | "timeout"
+  | "no_attestation";
 
 export interface GateContract {
   /** The command to run. */
@@ -33,6 +46,11 @@ export interface GateRun {
   output: string;
   /** True when the runner stopped it at the timeout. */
   timedOut?: boolean;
+  /**
+   * The command never became a process — it could not be spawned, the shell
+   * was missing, the working directory was gone. Not a verdict on the work.
+   */
+  spawnError?: string;
 }
 
 export interface GateVerdict {
@@ -62,11 +80,31 @@ function compile(source: string | undefined): RegExp | null {
  * success pattern is never a pass.
  */
 export function evaluateGate(contract: GateContract, run: GateRun): GateVerdict {
+  if (run.spawnError) {
+    return {
+      outcome: "no_attestation",
+      ok: false,
+      reason: `gate never ran (${run.spawnError}) — nothing was proved either way`,
+    };
+  }
+
+  // A timeout is a real verdict: the check was given its deadline and did not
+  // clear it. That is different from the case below.
   if (run.timedOut || (run.status === null && run.signal)) {
     return {
       outcome: "timeout",
       ok: false,
       reason: `gate timed out after ${contract.timeoutMs ?? "the default"}ms`,
+    };
+  }
+
+  // Neither an exit code nor a signal: the process did not run to a verdict
+  // and nothing killed it, so there is no result to report as one.
+  if (run.status === null) {
+    return {
+      outcome: "no_attestation",
+      ok: false,
+      reason: "gate produced no exit status — nothing was proved either way",
     };
   }
 
@@ -80,7 +118,7 @@ export function evaluateGate(contract: GateContract, run: GateRun): GateVerdict 
   }
 
   if (run.status !== 0) {
-    return { outcome: "failure", ok: false, reason: `gate exited ${run.status ?? "abnormally"}` };
+    return { outcome: "failure", ok: false, reason: `gate exited ${run.status}` };
   }
 
   const expectPattern = compile(contract.expect);
@@ -99,6 +137,48 @@ export function evaluateGate(contract: GateContract, run: GateRun): GateVerdict 
     ok: true,
     reason: expectPattern ? `gate passed and matched /${contract.expect}/` : "gate exited 0",
   };
+}
+
+/** The part of a call a gate needs in order to know who else was in the room. */
+export interface GateSibling {
+  id: number;
+  label: string;
+  status: string;
+  workDir?: string;
+}
+
+/**
+ * Which other calls were live in the same working directory while this gate
+ * ran — the ones that make its verdict unattributable.
+ *
+ * Only concurrency in the *same* directory counts. Two agents under
+ * `isolation: "worktree"` have their own checkouts and cannot disturb each
+ * other, which is exactly why isolation is the fix rather than a warning.
+ */
+export function sharedWith(
+  self: GateSibling,
+  subject: string,
+  siblings: readonly GateSibling[],
+): string[] {
+  return siblings
+    .filter((s) => s.id !== self.id && s.status === "running" && (s.workDir ?? subject) === subject)
+    .map((s) => s.label);
+}
+
+/**
+ * One line saying what a verdict is worth, given who else was editing.
+ * A pass earned over a tree two other agents were changing is reported as what
+ * it is: true of the tree, not of this agent's work.
+ */
+export function attributionNote(record: {
+  ok: boolean;
+  sharedWith: readonly string[];
+}): string | null {
+  if (record.sharedWith.length === 0) return null;
+  const others = record.sharedWith.join(", ");
+  return record.ok
+    ? `judged a directory ${others} ${record.sharedWith.length === 1 ? "was" : "were"} also changing — true of the tree, not of this agent's work alone`
+    : `judged a directory ${others} ${record.sharedWith.length === 1 ? "was" : "were"} also changing — the cause may not be this agent's work`;
 }
 
 /** An unparseable pattern is a broken contract, not a passing one. */

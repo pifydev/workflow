@@ -65,6 +65,35 @@ export interface AgentCallState {
   result?: unknown;
   /** True when this result came from a prior run instead of a model. */
   cached?: boolean;
+  /** Where this call ran, so a gate verdict can name the tree it judged. */
+  workDir?: string;
+  /** What this call's gate proved, when it had one. */
+  gate?: GateRecord;
+}
+
+/**
+ * A gate verdict together with the thing it was a verdict *about*.
+ *
+ * A verdict on its own is not evidence — "bun test passed" says nothing until
+ * you know which tree it ran against and whether that tree was still moving.
+ * Agents without `isolation` share one working directory, so inside
+ * `parallel()` a gate can run over a checkout two other agents are mid-edit
+ * in. It still returns an honest exit code; that code is simply not about the
+ * agent it gets attributed to. Recording the subject is what lets the run say
+ * so instead of reporting a borrowed pass.
+ */
+export interface GateRecord {
+  command: string;
+  outcome: string;
+  ok: boolean;
+  reason: string;
+  /** The directory the gate judged. */
+  subject: string;
+  /**
+   * Labels of other calls that were live in the same directory while this gate
+   * ran. Non-empty means the verdict cannot be attributed to this call alone.
+   */
+  sharedWith: string[];
 }
 
 /**

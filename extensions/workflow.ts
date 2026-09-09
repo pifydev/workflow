@@ -53,9 +53,11 @@ import {
   type WorkflowRun,
 } from "../src/types.ts";
 import {
+  attributionNote,
   contractProblems,
   evaluateGate,
   normalizeGate,
+  sharedWith,
   type GateContract,
   type GateVerdict,
 } from "../src/gate.ts";
@@ -68,20 +70,50 @@ const FALLBACK_AGENT = "scout";
 const GATE_TIMEOUT_MS = 120_000;
 
 /**
- * Run a gate command with the shell in the child's working directory.
- * Gate commands come from the workflow script — the same trust level as the
- * bash tool in this session.
+ * Run a gate, record what it judged, and return whether the call may proceed.
+ * The verdict is kept on the call whether it passed or failed: a run that only
+ * remembers its failures cannot tell you that a pass was earned over a tree
+ * somebody else was editing.
  */
+function applyGate(
+  gate: string | GateContract,
+  call: AgentCallState,
+  workDir: string,
+  run: WorkflowRun,
+): boolean {
+  const verdict = runGate(gate, workDir);
+  const shared = sharedWith(call, workDir, run.agents);
+  call.gate = {
+    command: normalizeGate(gate).command,
+    outcome: verdict.outcome,
+    ok: verdict.ok,
+    reason: verdict.reason,
+    subject: workDir,
+    sharedWith: shared,
+  };
+  const note = attributionNote({ ok: verdict.ok, sharedWith: shared });
+  run.logs.push(
+    `gate ${verdict.outcome} for ${call.label}: ${verdict.reason}` +
+      (note ? ` — ${note}` : "") +
+      (!verdict.ok && verdict.output ? ` — ${verdict.output.slice(0, 160)}` : ""),
+  );
+  return verdict.ok;
+}
+
 /**
- * Run a gate and judge it against its contract. A bare string keeps the old
- * exit-code meaning; a contract can also say what success has to look like,
- * which is what stops a command that never ran the check from passing.
+ * Run a gate and judge it against its contract, with the shell in the child's
+ * working directory. A bare string keeps the exit-code meaning; a contract can
+ * also say what success has to look like, which is what stops a command that
+ * never ran the check from passing. Gate commands come from the workflow
+ * script — the same trust level as the bash tool in this session.
  */
 function runGate(gate: string | GateContract, cwd: string): GateVerdict & { output: string } {
   const contract = normalizeGate(gate);
   const problems = contractProblems(contract);
   if (problems.length > 0) {
-    return { outcome: "failure", ok: false, reason: problems.join("; "), output: "" };
+    // A gate that cannot be run is not a verdict on the work. Calling this a
+    // failure would report a typo in the gate as a defect in the code.
+    return { outcome: "no_attestation", ok: false, reason: problems.join("; "), output: "" };
   }
   const timeoutMs = contract.timeoutMs ?? GATE_TIMEOUT_MS;
   try {
@@ -100,14 +132,21 @@ function runGate(gate: string | GateContract, cwd: string): GateVerdict & { outp
         signal: result.signal,
         output,
         timedOut: result.error?.message?.includes("ETIMEDOUT") || result.signal === "SIGTERM",
+        // spawnSync reports a failure to start in `error` rather than by
+        // throwing, and a timeout arrives the same way — so the timeout has to
+        // be ruled out first or every deadline would read as "never ran".
+        spawnError:
+          result.error && !result.error.message?.includes("ETIMEDOUT")
+            ? result.error.message
+            : undefined,
       },
     );
     return { ...verdict, output };
   } catch (err) {
     return {
-      outcome: "failure",
+      outcome: "no_attestation",
       ok: false,
-      reason: err instanceof Error ? err.message : String(err),
+      reason: `gate could not be started: ${err instanceof Error ? err.message : String(err)}`,
       output: "",
     };
   }
@@ -305,6 +344,7 @@ export default function workflow(pi: ExtensionAPI) {
         isolation = createIsolationWorktree(ctx.cwd, `${run.runId}-${call.label}`);
       }
       const workDir = isolation?.path ?? ctx.cwd;
+      call.workDir = workDir;
 
       const promptHost = ctx as unknown as {
         getSystemPromptOptions?: () => { customPrompt?: string; appendSystemPrompt?: string };
@@ -393,14 +433,10 @@ export default function workflow(pi: ExtensionAPI) {
           renderWidget();
           return null;
         }
-        if (opts.gate) {
-          const gate = runGate(opts.gate, workDir);
-          if (!gate.ok) {
-            call.status = "error";
-            run.logs.push(`gate ${gate.outcome} for ${call.label}: ${gate.reason}${gate.output ? ` — ${gate.output.slice(0, 160)}` : ""}`);
-            renderWidget();
-            return null;
-          }
+        if (opts.gate && !applyGate(opts.gate, call, workDir, run)) {
+          call.status = "error";
+          renderWidget();
+          return null;
         }
         call.status = "done";
         // Structured results cross the vm boundary as plain data.
@@ -409,15 +445,10 @@ export default function workflow(pi: ExtensionAPI) {
 
       // v0.2 gate: verify the child's work by running a command instead of
       // asking another model (tintinweb). Non-zero exit fails the call.
-      if (opts?.gate) {
-        const gate = runGate(opts.gate, workDir);
-        if (!gate.ok) {
-          call.status = "error";
-          run.logs.push(`gate failed for ${call.label}: ${gate.output.slice(0, 200)}`);
-          renderWidget();
-          return null;
-        }
-        run.logs.push(`gate passed for ${call.label} (${gate.reason})`);
+      if (opts?.gate && !applyGate(opts.gate, call, workDir, run)) {
+        call.status = "error";
+        renderWidget();
+        return null;
       }
 
       call.status = "done";
@@ -513,7 +544,10 @@ export default function workflow(pi: ExtensionAPI) {
       "(name loads .pi/workflows/<name>.js). background=true returns a runId for workflow_status. " +
       "agent() extras: gate=shell command run after the child (non-zero exit fails the call), or " +
       "gate={command, expect, failure, timeoutMs} so a command that exits 0 without printing the " +
-      "expected evidence fails as result_missing instead of passing; " +
+      "expected evidence fails as result_missing instead of passing. A gate that could not run at " +
+      "all (command will not spawn, expect/failure is not a valid regex) is no_attestation, not " +
+      "failure — fix the gate, not the code. Gate verdicts are reported with the run; a gate that " +
+      "judged a directory another agent was still editing says so, and isolation=worktree is the fix; " +
       "isolation=worktree runs the child in its own git worktree for mutating steps; " +
       "schema=<JSON Schema> makes the child answer with data — agent() then resolves the validated object " +
       "(one retry on mismatch, null if it still fails), so scripts never parse prose. " +

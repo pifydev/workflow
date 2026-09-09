@@ -87,7 +87,32 @@ await agent("Fix the failing test.", {
 })
 ```
 
-A command that never ran the check — a mistyped script under `sh -c`, a runner that matched no tests, a stray `|| true` — exits 0 and fails as **`result_missing`** instead of certifying the step. A `failure` pattern beats a zero exit. A killed run reports `timeout` rather than a generic failure. Four outcomes, so the log says which of them happened.
+A command that never ran the check — a mistyped script under `sh -c`, a runner that matched no tests, a stray `|| true` — exits 0 and fails as **`result_missing`** instead of certifying the step. A `failure` pattern beats a zero exit. A killed run reports `timeout` rather than a generic failure.
+
+One step further: a check that **ran and said no** is evidence, and a check that **could not run at all** is not evidence of anything. A command that will not spawn, a runner that is not installed, a gate whose own regex does not compile — none of those are the code failing, and calling them `failure` sends the reader debugging the work instead of fixing the gate. That is **`no_attestation`**: still not a pass, but honest about having proved nothing either way. A timeout stays a real verdict, because the check was given its deadline and did not clear it.
+
+Five outcomes, so the result says which of them happened.
+
+### A verdict names what it judged
+
+`agent()` without `isolation` runs in your checkout — and so does its gate. Inside `parallel()` that means a gate can pass over a tree another agent is still editing. The exit code is honest about the directory and misleading about the agent it gets attributed to.
+
+So a verdict is recorded with its subject, and a run that cannot attribute one says so:
+
+```
+Gates: 1 success, 1 no_attestation
+  ✓ fast — success: gate exited 0
+      judged a directory slow was also changing — true of the tree, not of this agent's work alone
+  ✗ probe — no_attestation: gate expect is not a valid regular expression
+```
+
+`isolation: "worktree"` is the fix rather than the warning: an isolated agent has its own checkout, nobody else can reach it, and its verdict is its own.
+
+### Gate results reach the model
+
+A rejected step makes `agent()` return `null`, and a script's own `.filter(Boolean)` then drops it — leaving the model a shorter array with no hint that anything was rejected or why, which is the one thing a gate exists to say. The ledger above travels with the run result, so the reasons arrive in bytes. A clean, attributable pass costs one word in the tally and no line; only verdicts that change what the reader should do spend one.
+
+Verified where it has to be true rather than in a fixture — `test/live/gate-wire.mjs` and `test/live/attribution-wire.mjs` read pi's own provider requests and confirm the ledger, the outcome and the reason reach the model, including the shared-tree note from a real `parallel()` race.
 
 ## Resume
 
