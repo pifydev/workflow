@@ -1,6 +1,6 @@
 ---
 name: workflow
-description: Use when a task needs deterministic multi-agent orchestration - fan out, verify, synthesize across many child agents with loops/conditionals - explains the workflow tool's script contract and when NOT to use it
+description: Use when a task needs deterministic multi-agent orchestration - fan out, verify, synthesize across many child agents with loops/conditionals
 ---
 
 # Workflows
