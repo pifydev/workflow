@@ -1,3 +1,4 @@
+import { clampWidth } from "./widget-clamp.ts";
 import { attributionNote } from "./gate.ts";
 import type { ThemeLike, WorkflowRun } from "./types.ts";
 
@@ -66,7 +67,7 @@ export function buildWidgetLines(run: WorkflowRun | null, theme: ThemeLike, now:
   lines.push(dim(`╭${title}${"─".repeat(pad)}${hint}╮`));
 
   if (run.phases.length > 0) {
-    lines.push(`${dim("│ ")}${theme.bold(run.phases[run.phases.length - 1]!)}`);
+    lines.push(`${dim("│ ")}${theme.bold(clampWidth(run.phases[run.phases.length - 1]!))}`);
   }
 
   for (const agent of run.agents.slice(-6)) {
@@ -77,7 +78,7 @@ export function buildWidgetLines(run: WorkflowRun | null, theme: ThemeLike, now:
           ? (s: string) => theme.fg("success", s)
           : (s: string) => theme.fg("error", s);
     const icon = agent.status === "running" ? "⟳" : agent.status === "done" ? "✓" : "✗";
-    lines.push(`${dim("│ ")}${paint(`${icon} ${agent.label}`)}${dim(` (${agent.agent})`)}`);
+    lines.push(`${dim("│ ")}${paint(`${icon} ${clampWidth(agent.label, 32)}`)}${dim(` (${clampWidth(agent.agent, 16)})`)}`);
   }
 
   const lastLog = run.logs[run.logs.length - 1];
