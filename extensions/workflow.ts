@@ -542,6 +542,7 @@ export default function workflow(pi: ExtensionAPI) {
   pi.registerTool({
     name: "workflow",
     label: "Run workflow",
+    promptSnippet: "Run a script that fans work across child agents and returns one answer",
     description:
       "Run a deterministic JavaScript orchestration script that fans work out across child agents. " +
       "Globals: agent(prompt, {agent?, label?, phase?, gate?, isolation?, schema?}) -> Promise<string|object|null> (agent types: " +
@@ -706,6 +707,7 @@ ${resumeSummary(cursor.reused, cacheSize)}` : "";
   pi.registerTool({
     name: "workflow_status",
     label: "Workflow status",
+    promptSnippet: "Progress of a running workflow",
     description: "Progress of a workflow run (default: the latest). Returns the result when finished.",
     parameters: Type.Object({
       runId: Type.Optional(Type.String()),
