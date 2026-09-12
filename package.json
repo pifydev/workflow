@@ -1,6 +1,6 @@
 {
   "name": "@pify/workflow",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Deterministic multi-step agent orchestration for pi: a Claude Code-style workflow tool with agent()/parallel()/pipeline() scripts over the shared agent catalog",
   "keywords": [
     "pi-package",

@@ -351,25 +351,33 @@ export default function workflow(pi: ExtensionAPI) {
       };
       const promptOptions = promptHost.getSystemPromptOptions?.() ?? {};
 
+      // `reload()` is not optional. `createAgentSession` only loads a resource
+      // loader it builds itself; one passed in is used exactly as handed over,
+      // and a fresh DefaultResourceLoader resolves neither `systemPrompt` nor
+      // `appendSystemPrompt` until it loads. Without it the child ran with no
+      // instructions at all — the call succeeds, the model answers, and it
+      // answers as a generic assistant with nothing to say it went wrong.
+      const loader = new DefaultResourceLoader({
+        cwd: workDir,
+        agentDir: getAgentDir(),
+        noExtensions: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        systemPrompt: promptOptions.customPrompt,
+        appendSystemPrompt: [
+          ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
+          def.systemPrompt,
+          "You are one step of a scripted workflow. Your final assistant message IS the value returned to the script — return raw data/report, no pleasantries, no questions.",
+          ...(opts?.schema ? [schemaInstruction(opts.schema)] : []),
+        ],
+      });
+      await loader.reload();
       const created = await createAgentSession({
         sessionManager: SessionManager.inMemory(workDir),
         model,
         thinkingLevel: (def.thinking ?? pi.getThinkingLevel()) as never,
         tools: def.tools,
-        resourceLoader: new DefaultResourceLoader({
-          cwd: workDir,
-          agentDir: getAgentDir(),
-          noExtensions: true,
-          noPromptTemplates: true,
-          noThemes: true,
-          systemPrompt: promptOptions.customPrompt,
-          appendSystemPrompt: [
-            ...(promptOptions.appendSystemPrompt ? [promptOptions.appendSystemPrompt] : []),
-            def.systemPrompt,
-            "You are one step of a scripted workflow. Your final assistant message IS the value returned to the script — return raw data/report, no pleasantries, no questions.",
-            ...(opts?.schema ? [schemaInstruction(opts.schema)] : []),
-          ],
-        }),
+        resourceLoader: loader,
       });
       session = created.session;
       releaseLive = live.register(run.runId, session);
