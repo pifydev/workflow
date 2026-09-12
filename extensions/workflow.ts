@@ -26,12 +26,20 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import {
+  consentQuestion,
+  decideConsent,
+  envConsent,
+  parseConsent,
+  readConsent,
+  writeConsent,
+} from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import {
@@ -167,16 +175,53 @@ export default function workflow(pi: ExtensionAPI) {
    */
   const live = new LiveChildren();
 
-  function loadDefs(cwd: string): void {
+  /** Where the suite records which projects you approved, and for what. */
+  function consentFile(): string {
+    return join(getAgentDir(), "pify-project-consent.json");
+  }
+
+  async function projectConsent(ctx: UiContext, scope: string, what: string, dir: string): Promise<boolean> {
+    if (!existsSync(dir)) return false;
+    let raw: string | null = null;
+    try {
+      raw = readFileSync(consentFile(), "utf8");
+    } catch {
+      raw = null;
+    }
+    const store = parseConsent(raw);
+    const verdict = decideConsent({
+      projectTrusted: (ctx as unknown as { isProjectTrusted?: () => boolean }).isProjectTrusted?.() ?? false,
+      remembered: readConsent(store, ctx.cwd, scope),
+      hasUI: ctx.hasUI,
+      envOverride: envConsent(process.env),
+    });
+    if (verdict !== "ask") return verdict === "allow";
+
+    const approved = await ctx.ui.confirm(`Load this project's ${scope}?`, consentQuestion(what, dir));
+    try {
+      writeFileSync(consentFile(), `${JSON.stringify(writeConsent(store, ctx.cwd, scope, approved), null, 2)}
+`);
+    } catch {
+      // An unwritable consent file costs us the memory of the answer, not the answer.
+    }
+    return approved;
+  }
+
+  function loadDefs(cwd: string, projectAllowed: boolean): void {
     defs = new Map();
     for (const [name, content] of Object.entries(BUILTIN_AGENTS)) {
       const def = parseAgentFile(name, content, "builtin");
       if (def) defs.set(def.name, def);
     }
-    for (const [dir, source] of [
-      [join(getAgentDir(), "agents"), "global"],
-      [join(cwd, ".pi", "agents"), "project"],
-    ] as const) {
+    // The project directory is consent-gated with the same "agents" scope
+    // subagent records: a def's body becomes a child system prompt, and a
+    // user who answered "no" to subagent must not have the same defs loaded
+    // here the moment a workflow runs.
+    const sources: Array<readonly [string, "global" | "project"]> = [
+      [join(getAgentDir(), "agents"), "global"] as const,
+      ...(projectAllowed ? [[join(cwd, ".pi", "agents"), "project"] as const] : []),
+    ];
+    for (const [dir, source] of sources) {
       try {
         for (const file of readdirSync(dir).filter((f) => f.endsWith(".md"))) {
           try {
@@ -595,6 +640,25 @@ export default function workflow(pi: ExtensionAPI) {
         const safe = params.name.trim().toLowerCase();
         if (!/^[a-z0-9._-]+$/.test(safe)) throw new Error(`Invalid workflow name "${params.name}".`);
         const dir = join(uiCtx.cwd, ".pi", "workflows");
+        // Saved workflows are repo-shipped EXECUTABLE CODE: the script fans
+        // out paid child-agent calls and its gate option runs arbitrary shell
+        // through spawnSync. The vm it runs in is cooperative discipline, not
+        // a security boundary — the code's old comment that a gate has "the
+        // same trust level as the bash tool in this session" is only true
+        // when the model wrote the script this session, and the name= path
+        // loads whatever a cloned repository put on disk. memory asks consent
+        // before injecting mere TEXT from a repo; code gets at least that.
+        const allowed = await projectConsent(
+          uiCtx,
+          "workflows",
+          "its own saved workflow scripts, which execute as code with shell-capable gates",
+          dir,
+        );
+        if (!allowed) {
+          throw new Error(
+            `Saved workflows from this repository are not approved. Approve when prompted in the TUI, or set PIFY_TRUST_PROJECT=1 for a headless run you trust.`,
+          );
+        }
         const file = ["", ".js", ".mjs"].map((ext) => join(dir, safe + ext)).find((f) => {
           try {
             return readFileSync(f, "utf8") !== undefined;
@@ -661,11 +725,11 @@ export default function workflow(pi: ExtensionAPI) {
       if (cursor) run.logs.push(`resume: ${cacheSize} cached agent result(s) available from ${resumeId}`);
 
       if (run.background) {
-        void execute(uiCtx, run, script, params.args, cursor).then(() => {
-          notify(uiCtx, `workflow ${run.runId}: ${run.status}`, run.status === "done" ? "info" : "warning");
-          // The result goes to the agent, not only to the screen — otherwise
-          // asking again was its only way to find out.
-          try {
+        void execute(uiCtx, run, script, params.args, cursor)
+          .then(() => {
+            notify(uiCtx, `workflow ${run.runId}: ${run.status}`, run.status === "done" ? "info" : "warning");
+            // The result goes to the agent, not only to the screen — otherwise
+            // asking again was its only way to find out.
             pi.sendMessage(
               {
                 customType: DELIVERY_TYPE,
@@ -675,10 +739,14 @@ export default function workflow(pi: ExtensionAPI) {
               },
               { deliverAs: "followUp", triggerTurn: true },
             );
-          } catch {
-            // Delivery is a convenience; workflow_status still works.
-          }
-        });
+          })
+          .catch(() => {
+            // The whole chain, not just sendMessage: a /reload or session
+            // switch mid-run makes every captured pi/ctx handle throw "ctx is
+            // stale" on next use, and an uncaught rejection here would take
+            // the process down. Delivery is a convenience; workflow_status
+            // still works.
+          });
         return {
           content: [{ type: "text", text: `Workflow ${run.runId} started. Poll workflow_status runId="${run.runId}".` }],
           details: { runId: run.runId },
@@ -739,7 +807,15 @@ ${pending.text}` }],
   // ── Lifecycle & command ──────────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
-    loadDefs(ctx.cwd);
+    loadDefs(
+      ctx.cwd,
+      await projectConsent(
+        ctx as UiContext,
+        "agents",
+        "its own agent definitions, which override the builtins of the same name",
+        join(ctx.cwd, ".pi", "agents"),
+      ),
+    );
     runs.clear();
     activeRun = null;
     for (const entry of ctx.sessionManager.getBranch()) {
