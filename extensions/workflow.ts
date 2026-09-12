@@ -32,6 +32,7 @@ import { basename, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { withUiLock } from "../src/ui-lock.ts";
 import {
   consentQuestion,
   decideConsent,
@@ -197,7 +198,7 @@ export default function workflow(pi: ExtensionAPI) {
     });
     if (verdict !== "ask") return verdict === "allow";
 
-    const approved = await ctx.ui.confirm(`Load this project's ${scope}?`, consentQuestion(what, dir));
+    const approved = await withUiLock(() => ctx.ui.confirm(`Load this project's ${scope}?`, consentQuestion(what, dir)));
     try {
       writeFileSync(consentFile(), `${JSON.stringify(writeConsent(store, ctx.cwd, scope, approved), null, 2)}
 `);
