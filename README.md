@@ -1,6 +1,6 @@
 # @pify/workflow
 
-[![npm version](https://img.shields.io/npm/v/@pify/workflow)](https://www.npmjs.com/package/@pify/workflow) [![npm downloads](https://img.shields.io/npm/dm/@pify/workflow)](https://www.npmjs.com/package/@pify/workflow)
+[![CI](https://github.com/pifydev/workflow/actions/workflows/ci.yml/badge.svg)](https://github.com/pifydev/workflow/actions/workflows/ci.yml) [![npm version](https://img.shields.io/npm/v/@pify/workflow)](https://www.npmjs.com/package/@pify/workflow) [![npm downloads](https://img.shields.io/npm/dm/@pify/workflow)](https://www.npmjs.com/package/@pify/workflow)
 
 Deterministic multi-step agent orchestration for [pi](https://github.com/earendil-works/pi). The model writes a small JavaScript script that fans work out across child agents, cross-checks the results, and returns one synthesised answer. Intermediate work stays in script variables rather than your chat context.
 
