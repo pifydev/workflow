@@ -506,7 +506,14 @@ export default function workflow(pi: ExtensionAPI) {
       }
 
       call.status = "done";
-      return isolation ? `${text}\n\n${isolationNote(isolation)}` : text;
+      if (!isolation) return text;
+      // Remove the worktree when the step changed nothing — the cleanup the
+      // README promised but the code never ran (removeIfUnchanged was imported
+      // and never called, leaking a worktree + branch per read-only step).
+      // Kept only when there is work to merge, which is the only time the
+      // merge note helps.
+      const removed = removeIfUnchanged(ctx.cwd, isolation);
+      return `${text}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(isolation)}`;
     } catch {
       call.status = "error";
       return null;
