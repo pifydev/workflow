@@ -38,8 +38,8 @@ import {
   decideConsent,
   envConsent,
   parseConsent,
+  persistConsent,
   readConsent,
-  writeConsent,
 } from "../src/consent.ts";
 import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
@@ -200,8 +200,7 @@ export default function workflow(pi: ExtensionAPI) {
 
     const approved = await withUiLock(() => ctx.ui.confirm(`Load this project's ${scope}?`, consentQuestion(what, dir)));
     try {
-      writeFileSync(consentFile(), `${JSON.stringify(writeConsent(store, ctx.cwd, scope, approved), null, 2)}
-`);
+      persistConsent(consentFile(), ctx.cwd, scope, approved);
     } catch {
       // An unwritable consent file costs us the memory of the answer, not the answer.
     }
