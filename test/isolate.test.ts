@@ -176,29 +176,22 @@ test("the isolation epilogue stamps {worktree, branch} on the call for a NON-PRO
 
 test("createIsolationWorktree makes a worktree + branch and avoids collisions", () => {
   const repo = makeRepo();
-  const home = mkdtempSync(join(tmpdir(), "pify-wf-home-"));
-  const prevHome = process.env.HOME;
-  const prevProfile = process.env.USERPROFILE;
-  // os.homedir() reads HOME (POSIX) / USERPROFILE (Windows) per call, so this
-  // keeps the created worktrees inside a temp dir instead of the real home.
-  process.env.HOME = home;
-  process.env.USERPROFILE = home;
+  // Inject a temp root rather than overriding HOME: os.homedir() is not reliably
+  // re-read per call under every runtime (bun on Linux caches it), so a runtime
+  // HOME override would leak worktrees into the real home on CI.
+  const root = mkdtempSync(join(tmpdir(), "pify-wf-root-"));
   try {
-    const a = createIsolationWorktree(repo, "My Feature!");
+    const a = createIsolationWorktree(repo, "My Feature!", root);
     assert.equal(a.branch, "agent/my-feature");
     assert.ok(existsSync(a.path), "worktree created on disk");
-    assert.ok(a.path.startsWith(home), "placed under the (temp) home, never the real one");
+    assert.ok(a.path.startsWith(root), "placed under the given root, never the real home");
 
     // A second request for the same slug must not collide with the first.
-    const b = createIsolationWorktree(repo, "My Feature!");
+    const b = createIsolationWorktree(repo, "My Feature!", root);
     assert.equal(b.branch, "agent/my-feature-2");
     assert.notEqual(a.path, b.path);
   } finally {
-    if (prevHome === undefined) delete process.env.HOME;
-    else process.env.HOME = prevHome;
-    if (prevProfile === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = prevProfile;
-    rmrf(home);
+    rmrf(root);
     rmrf(repo);
   }
 });

@@ -33,7 +33,12 @@ export function sanitizeSlug(raw: string): string {
   return slug || "run";
 }
 
-export function createIsolationWorktree(cwd: string, rawSlug: string): Isolation {
+/** Where isolation worktrees live by default: ~/.worktrees. */
+export function defaultWorktreeRoot(): string {
+  return join(homedir(), ".worktrees");
+}
+
+export function createIsolationWorktree(cwd: string, rawSlug: string, root: string = defaultWorktreeRoot()): Isolation {
   let toplevel: string;
   try {
     toplevel = git(cwd, ["rev-parse", "--show-toplevel"]);
@@ -44,11 +49,11 @@ export function createIsolationWorktree(cwd: string, rawSlug: string): Isolation
   const slug = sanitizeSlug(rawSlug);
 
   let branch = `agent/${slug}`;
-  let path = join(homedir(), ".worktrees", repo, slug);
+  let path = join(root, repo, slug);
   let counter = 2;
   while (existsSync(path) || branchExists(cwd, branch)) {
     branch = `agent/${slug}-${counter}`;
-    path = join(homedir(), ".worktrees", repo, `${slug}-${counter}`);
+    path = join(root, repo, `${slug}-${counter}`);
     counter++;
     if (counter > 50) throw new Error("Could not find a free worktree slot.");
   }
