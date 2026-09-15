@@ -45,13 +45,12 @@ import { LiveChildren, cancelNote, type CancelReason } from "../src/cancel.ts";
 import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts";
 import {
   createIsolationWorktree,
-  isolationNote,
-  removeIfUnchanged,
+  settleWorktree,
   type Isolation,
 } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
-import { runScript, type AgentOptions } from "../src/sandbox.ts";
+import { runScript, ScriptTimeoutError, type AgentOptions } from "../src/sandbox.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -73,8 +72,6 @@ import {
 import { ResumeCursor, buildCache, callKey, resumeSummary } from "../src/resume.ts";
 
 const RUN_ENTRY = "workflow-run";
-const CLEAN_WORKTREE_NOTE =
-  "Ran isolated in a temporary worktree; it changed nothing, so the worktree was removed.";
 const FALLBACK_AGENT = "scout";
 const GATE_TIMEOUT_MS = 120_000;
 
@@ -116,7 +113,7 @@ function applyGate(
  * never ran the check from passing. Gate commands come from the workflow
  * script — the same trust level as the bash tool in this session.
  */
-function runGate(gate: string | GateContract, cwd: string): GateVerdict & { output: string } {
+export function runGate(gate: string | GateContract, cwd: string): GateVerdict & { output: string } {
   const contract = normalizeGate(gate);
   const problems = contractProblems(contract);
   if (problems.length > 0) {
@@ -132,6 +129,11 @@ function runGate(gate: string | GateContract, cwd: string): GateVerdict & { outp
       encoding: "utf8",
       timeout: timeoutMs,
       windowsHide: true,
+      // A real test suite or build easily prints past spawnSync's 1 MiB
+      // default; overflow surfaces as an ENOBUFS `error`, which this code
+      // would otherwise read as spawnError → no_attestation, rejecting work
+      // that in fact passed. Give the gate room to actually report.
+      maxBuffer: 16 * 1024 * 1024,
     });
     const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
     const verdict = evaluateGate(
@@ -350,9 +352,11 @@ export default function workflow(pi: ExtensionAPI) {
   ): Promise<unknown> {
     // The script keeps running inside the vm after a cancel — it is ordinary
     // JavaScript and nothing can interrupt it mid-statement. What we can do is
-    // refuse to start anything new, so a cancelled run stops costing money at
-    // the next agent() instead of finishing its whole fan-out.
-    if (run.status === "cancelled") return null;
+    // refuse to start anything new, so a stopped run stops costing money at
+    // the next agent() instead of finishing its whole fan-out. Any terminal
+    // status counts, not just "cancelled": a timeout marks the run cancelled,
+    // but an error or completion mid-fan-out must also refuse new children.
+    if (run.status !== "running") return null;
 
     const def = defs.get((opts?.agent ?? FALLBACK_AGENT).toLowerCase()) ?? defs.get(FALLBACK_AGENT);
     if (!def) return null;
@@ -373,6 +377,12 @@ export default function workflow(pi: ExtensionAPI) {
     let session: AgentSession | null = null;
     let unsubscribe: (() => void) | null = null;
     let releaseLive: (() => void) | null = null;
+    // Declared outside the try so the finally can ALWAYS close the worktree,
+    // and settled at most once (the prose path settles inline to fold the note
+    // into its text; every other path — schema, gate failure, abort, error,
+    // thrown — leaves it to the finally).
+    let isolation: Isolation | null = null;
+    let worktreeSettled = false;
     try {
       let model = ctx.model ?? null;
       if (def.model) {
@@ -384,7 +394,6 @@ export default function workflow(pi: ExtensionAPI) {
       if (!model) throw new Error("No model available");
 
       // v0.2: worktree isolation for mutating steps.
-      let isolation: Isolation | null = null;
       if (opts?.isolation === "worktree") {
         isolation = createIsolationWorktree(ctx.cwd, `${run.runId}-${call.label}`);
       }
@@ -506,13 +515,13 @@ export default function workflow(pi: ExtensionAPI) {
 
       call.status = "done";
       if (!isolation) return text;
-      // Remove the worktree when the step changed nothing — the cleanup the
-      // README promised but the code never ran (removeIfUnchanged was imported
-      // and never called, leaking a worktree + branch per read-only step).
-      // Kept only when there is work to merge, which is the only time the
-      // merge note helps.
-      const removed = removeIfUnchanged(ctx.cwd, isolation);
-      return `${text}\n\n${removed ? CLEAN_WORKTREE_NOTE : isolationNote(isolation)}`;
+      // Prose success is the only path that folds the worktree note into its
+      // returned text, so it settles inline. Every other exit — schema, gate
+      // failure, abort, error, thrown — leaves the worktree to the finally,
+      // which is what stopped it leaking on those paths before.
+      worktreeSettled = true;
+      const { note } = settleWorktree(ctx.cwd, isolation, call);
+      return `${text}\n\n${note}`;
     } catch {
       call.status = "error";
       return null;
@@ -532,6 +541,15 @@ export default function workflow(pi: ExtensionAPI) {
         } catch {
           // fine
         }
+      }
+      // Close out the worktree on EVERY path that did not already (schema,
+      // gate failure, abort, error, thrown): removeIfUnchanged runs, and a
+      // worktree kept because it holds work records its {worktree, branch} on
+      // the call so the edit location is never orphaned. Dispose the session
+      // first so its files are not in the tree we are inspecting.
+      if (isolation && !worktreeSettled) {
+        worktreeSettled = true;
+        settleWorktree(ctx.cwd, isolation, call);
       }
       renderWidget();
     }
@@ -568,7 +586,14 @@ export default function workflow(pi: ExtensionAPI) {
       // "done" would report a result nobody produced.
       if (run.status !== "cancelled") run.status = "done";
     } catch (err) {
-      if (run.status !== "cancelled") {
+      // A script timeout is not just an error to record: the vm keeps running
+      // after the deadline (ordinary JS, uninterruptible mid-statement) and
+      // would spawn more paid child agents at every remaining agent() call.
+      // cancelRun aborts the live children and, with the loosened guard in
+      // spawnChildAgent, refuses any the zombie script still tries to start.
+      if (err instanceof ScriptTimeoutError && run.status === "running") {
+        cancelRun(run, "timeout");
+      } else if (run.status !== "cancelled") {
         run.status = "error";
         run.error = err instanceof Error ? err.message : String(err);
       }

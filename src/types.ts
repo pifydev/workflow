@@ -67,6 +67,15 @@ export interface AgentCallState {
   cached?: boolean;
   /** Where this call ran, so a gate verdict can name the tree it judged. */
   workDir?: string;
+  /**
+   * When the call ran under `isolation: "worktree"` and left work behind, the
+   * worktree path and branch its edits live on. Written by the isolation
+   * epilogue on every terminal outcome — success, schema, gate failure, abort,
+   * error — so the edit location is never orphaned. Absent when the run was
+   * read-only (its worktree was cleaned up) or never isolated.
+   */
+  worktree?: string;
+  branch?: string;
   /** What this call's gate proved, when it had one. */
   gate?: GateRecord;
 }

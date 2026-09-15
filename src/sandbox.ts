@@ -80,6 +80,14 @@ export interface RunScriptOptions {
   maxAgents?: number;
 }
 
+/**
+ * Thrown when the wall-clock deadline fires. A distinct type so the caller can
+ * tell a timeout apart from a script error and cancel the run — aborting the
+ * child agents the zombie vm would otherwise keep spawning — rather than only
+ * marking the record "error" while paid children run on.
+ */
+export class ScriptTimeoutError extends Error {}
+
 export async function runScript(
   script: string,
   args: unknown,
@@ -162,7 +170,7 @@ export async function runScript(
       promise,
       new Promise((_resolve, reject) => {
         timer = setTimeout(
-          () => reject(new Error(`Workflow script timed out after ${Math.round(timeoutMs / 1000)}s.`)),
+          () => reject(new ScriptTimeoutError(`Workflow script timed out after ${Math.round(timeoutMs / 1000)}s.`)),
           timeoutMs,
         );
       }),

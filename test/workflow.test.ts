@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runScript, stripExports, type SandboxHooks } from "../src/sandbox.ts";
+import { runScript, ScriptTimeoutError, stripExports, type SandboxHooks } from "../src/sandbox.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import type { ThemeLike, WorkflowRun } from "../src/types.ts";
 
@@ -106,6 +106,28 @@ test("timeout rejects long-running scripts", async () => {
   await assert.rejects(
     () => runScript('return await agent("hang");', undefined, h, { timeoutMs: 200 }),
     /timed out/,
+  );
+});
+
+test("a timeout rejects with ScriptTimeoutError so the run can be cancelled, not just logged", async () => {
+  // The extension keys on this type to call cancelRun(run, "timeout"): a bare
+  // Error would only be recorded as run.error while the zombie vm kept spawning
+  // paid child agents. A distinct type lets the timeout be told apart from an
+  // ordinary script throw.
+  const h = hooks({ agent: () => new Promise(() => {}) });
+  await assert.rejects(
+    () => runScript('return await agent("hang");', undefined, h, { timeoutMs: 100 }),
+    (err: unknown) => {
+      assert.ok(err instanceof ScriptTimeoutError, "timeout is a ScriptTimeoutError");
+      assert.match((err as Error).message, /timed out/);
+      return true;
+    },
+  );
+  // An ordinary throw from the script is NOT a timeout — the discriminator must
+  // not over-match, or a real error would be silently treated as a deadline.
+  await assert.rejects(
+    () => runScript('throw new Error("boom");', undefined, h),
+    (err: unknown) => !(err instanceof ScriptTimeoutError) && /boom/.test((err as Error).message),
   );
 });
 

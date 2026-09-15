@@ -80,6 +80,50 @@ export function isolationNote(isolation: Isolation): string {
   ].join("\n");
 }
 
+/** Note when an isolated run changed nothing and its worktree was removed. */
+export const CLEAN_WORKTREE_NOTE =
+  "Ran isolated in a temporary worktree; it changed nothing, so the worktree was removed.";
+
+/**
+ * The fields the isolation epilogue writes onto a call record. Kept structural
+ * so isolate.ts stays free of any dependency on the extension's types — the
+ * run's AgentCallState satisfies it by shape.
+ */
+export interface IsolationSink {
+  worktree?: string;
+  branch?: string;
+}
+
+/**
+ * Close out an isolated child's worktree exactly once, whatever its outcome.
+ *
+ * This is the epilogue EVERY terminal path of a child call must reach —
+ * success, schema mismatch, gate failure, abort, or a thrown error. Before,
+ * only the prose success path ran it, so a `schema:` step (or any failure or
+ * abort) left its worktree and branch behind forever. It runs
+ * removeIfUnchanged — a read-only step's worktree is deleted, a step that did
+ * work is kept — and when the worktree is kept it records where the edits live
+ * on the call so a non-prose result (a schema object, a null from an error)
+ * can still name the location instead of orphaning it.
+ *
+ * Returns the human note for callers that render prose; callers on non-prose
+ * paths rely on the pointer written to `sink`. Never throws (removeIfUnchanged
+ * already swallows its own failures): the cleanup must not sink a run.
+ */
+export function settleWorktree(
+  cwd: string,
+  isolation: Isolation,
+  sink: IsolationSink,
+): { removed: boolean; note: string } {
+  const removed = removeIfUnchanged(cwd, isolation);
+  if (removed) return { removed: true, note: CLEAN_WORKTREE_NOTE };
+  // Kept: there is work to merge. Record the pointer so the location survives
+  // on the call record even when the returned value is data or null.
+  sink.worktree = isolation.path;
+  sink.branch = isolation.branch;
+  return { removed: false, note: isolationNote(isolation) };
+}
+
 /**
  * Remove a worktree the child left untouched. An isolated run that changed
  * nothing is the common case — a review, a search, a question — and keeping
