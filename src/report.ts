@@ -35,14 +35,44 @@ export function formatGates(run: WorkflowRun): string | null {
   return lines.join("\n");
 }
 
+/**
+ * The calls that produced nothing for a reason other than a gate.
+ *
+ * Same problem as the gates, one layer down: a child that threw, hit a
+ * provider error, answered with nothing, missed its schema twice or was
+ * cancelled before it started all resolve `null`, and `null` carries no
+ * reason. A gate rejection is already told by the ledger above, so a call
+ * whose only failure is its gate is not repeated here.
+ */
+export function formatFailures(run: WorkflowRun): string | null {
+  const failed = run.agents.filter(
+    (a) => (a.status === "error" || a.status === "aborted") && !(a.gate && !a.gate.ok && !a.error),
+  );
+  if (failed.length === 0) return null;
+
+  const tally = new Map<string, number>();
+  for (const call of failed) tally.set(call.status, (tally.get(call.status) ?? 0) + 1);
+  const summary = [...tally.entries()].map(([status, n]) => `${n} ${status}`).join(", ");
+
+  const lines = [`Failures: ${summary}`];
+  for (const call of failed) {
+    lines.push(`  ✗ ${call.label} — ${call.status}${call.error ? `: ${call.error}` : ""}`);
+  }
+  return lines.join("\n");
+}
+
 export function formatResult(run: WorkflowRun): string {
   const header = `[workflow ${run.runId}] ${run.status} — ${run.agents.length} agents, ${run.phases.length} phases`;
-  if (run.status === "error") return `${header}\nError: ${run.error ?? "unknown"}`;
+  if (run.status === "error") return [header, `Error: ${run.error ?? "unknown"}`, formatFailures(run)].filter(Boolean).join("\n");
   if (run.status === "running") {
-    return `${header}\nStill running — poll workflow_status runId="${run.runId}".`;
+    return `${header}\nStill running — its result is delivered when it finishes; workflow_status runId="${run.runId}" shows progress.`;
   }
-  const gates = formatGates(run);
-  return [header, gates, run.result ?? "(script returned nothing)"].filter(Boolean).join("\n");
+  // A cancelled run's error is the cancel note — who stopped it and what that
+  // cost. Hiding it left the model with a verdict and no cause.
+  const cancelled = run.status === "cancelled" ? run.error : null;
+  return [header, cancelled, formatGates(run), formatFailures(run), run.result ?? "(script returned nothing)"]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export function formatStatus(run: WorkflowRun): string {

@@ -29,9 +29,10 @@ import { Type } from "typebox";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
-import { spawnSync } from "node:child_process";
 
 import { BUILTIN_AGENTS } from "../src/builtin.ts";
+import { admitChild } from "../src/admit.ts";
+import { waitUntil } from "../src/wait.ts";
 import { withUiLock } from "../src/ui-lock.ts";
 import {
   consentQuestion,
@@ -60,20 +61,16 @@ import {
   type AgentDef,
   type WorkflowRun,
 } from "../src/types.ts";
-import {
-  attributionNote,
-  contractProblems,
-  evaluateGate,
-  normalizeGate,
-  sharedWith,
-  type GateContract,
-  type GateVerdict,
-} from "../src/gate.ts";
+import { attributionNote, normalizeGate, runGate, sharedWith, type GateContract } from "../src/gate.ts";
+
+// The gate runner lives in src/gate.ts — vendored, byte-identical across
+// subagent / swarm / workflow — and is re-exported here so the gate tests
+// keep their import.
+export { runGate };
 import { ResumeCursor, buildCache, callKey, resumeSummary } from "../src/resume.ts";
 
 const RUN_ENTRY = "workflow-run";
 const FALLBACK_AGENT = "scout";
-const GATE_TIMEOUT_MS = 120_000;
 
 /**
  * Run a gate, record what it judged, and return whether the call may proceed.
@@ -81,13 +78,13 @@ const GATE_TIMEOUT_MS = 120_000;
  * remembers its failures cannot tell you that a pass was earned over a tree
  * somebody else was editing.
  */
-function applyGate(
+async function applyGate(
   gate: string | GateContract,
   call: AgentCallState,
   workDir: string,
   run: WorkflowRun,
-): boolean {
-  const verdict = runGate(gate, workDir);
+): Promise<boolean> {
+  const verdict = await runGate(gate, workDir);
   const shared = sharedWith(call, workDir, run.agents);
   call.gate = {
     command: normalizeGate(gate).command,
@@ -104,63 +101,6 @@ function applyGate(
       (!verdict.ok && verdict.output ? ` — ${verdict.output.slice(0, 160)}` : ""),
   );
   return verdict.ok;
-}
-
-/**
- * Run a gate and judge it against its contract, with the shell in the child's
- * working directory. A bare string keeps the exit-code meaning; a contract can
- * also say what success has to look like, which is what stops a command that
- * never ran the check from passing. Gate commands come from the workflow
- * script — the same trust level as the bash tool in this session.
- */
-export function runGate(gate: string | GateContract, cwd: string): GateVerdict & { output: string } {
-  const contract = normalizeGate(gate);
-  const problems = contractProblems(contract);
-  if (problems.length > 0) {
-    // A gate that cannot be run is not a verdict on the work. Calling this a
-    // failure would report a typo in the gate as a defect in the code.
-    return { outcome: "no_attestation", ok: false, reason: problems.join("; "), output: "" };
-  }
-  const timeoutMs = contract.timeoutMs ?? GATE_TIMEOUT_MS;
-  try {
-    const result = spawnSync(contract.command, {
-      shell: true,
-      cwd,
-      encoding: "utf8",
-      timeout: timeoutMs,
-      windowsHide: true,
-      // A real test suite or build easily prints past spawnSync's 1 MiB
-      // default; overflow surfaces as an ENOBUFS `error`, which this code
-      // would otherwise read as spawnError → no_attestation, rejecting work
-      // that in fact passed. Give the gate room to actually report.
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    const output = `${result.stdout ?? ""}${result.stderr ?? ""}`.trim();
-    const verdict = evaluateGate(
-      { ...contract, timeoutMs },
-      {
-        status: result.status,
-        signal: result.signal,
-        output,
-        timedOut: result.error?.message?.includes("ETIMEDOUT") || result.signal === "SIGTERM",
-        // spawnSync reports a failure to start in `error` rather than by
-        // throwing, and a timeout arrives the same way — so the timeout has to
-        // be ruled out first or every deadline would read as "never ran".
-        spawnError:
-          result.error && !result.error.message?.includes("ETIMEDOUT")
-            ? result.error.message
-            : undefined,
-      },
-    );
-    return { ...verdict, output };
-  } catch (err) {
-    return {
-      outcome: "no_attestation",
-      ok: false,
-      reason: `gate could not be started: ${err instanceof Error ? err.message : String(err)}`,
-      output: "",
-    };
-  }
 }
 
 type UiContext = ExtensionContext;
@@ -239,14 +179,46 @@ export default function workflow(pi: ExtensionAPI) {
     }
   }
 
+  /** Grace period a finished run stays on screen, so the verdict is seen. */
+  const WIDGET_GRACE_MS = 15_000;
+  /**
+   * The one timer that re-renders after the grace period. Nothing else calls
+   * renderWidget once a run is over — the children are gone and the script has
+   * returned — so without it the finished widget stayed up until the next run.
+   */
+  let widgetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearWidgetTimer(): void {
+    if (widgetTimer) clearTimeout(widgetTimer);
+    widgetTimer = null;
+  }
+
   function renderWidget(ctx: UiContext | null = lastUiCtx): void {
     if (!ctx || !ctx.hasUI) return;
     lastUiCtx = ctx;
     const run = activeRun;
     const now = Date.now();
-    if (!run || (run.status !== "running" && (run.finishedAt ?? 0) < now - 15_000)) {
+    clearWidgetTimer();
+    if (!run || (run.status !== "running" && (run.finishedAt ?? 0) < now - WIDGET_GRACE_MS)) {
       ctx.ui.setWidget("workflow", undefined);
       return;
+    }
+    if (run.status !== "running") {
+      // One re-check just past the grace edge. The callback is guarded: after
+      // a session switch the captured ctx throws "ctx is stale", and a timer
+      // callback has nobody to catch for it.
+      widgetTimer = setTimeout(
+        () => {
+          widgetTimer = null;
+          try {
+            renderWidget();
+          } catch {
+            // stale ctx — the widget went away with its session
+          }
+        },
+        Math.max(0, (run.finishedAt ?? now) + WIDGET_GRACE_MS - now) + 50,
+      );
+      widgetTimer.unref?.();
     }
     ctx.ui.setWidget(
       "workflow",
@@ -274,7 +246,10 @@ export default function workflow(pi: ExtensionAPI) {
       run.logs.push(run.error);
     }
     for (const call of run.agents) {
-      if (call.status === "running") call.status = "aborted";
+      if (call.status === "running") {
+        call.status = "aborted";
+        call.error ??= "stopped with the run";
+      }
     }
     renderWidget();
   }
@@ -384,6 +359,11 @@ export default function workflow(pi: ExtensionAPI) {
     let isolation: Isolation | null = null;
     let worktreeSettled = false;
     try {
+      // Second look at the flag: the slot may have arrived long after Esc.
+      // cancelRun only aborts sessions in `live`, and this call has none yet.
+      // Inside the try on purpose — the finally is what gives the slot back.
+      if (!admitChild(run, call, "slot")) return null;
+
       let model = ctx.model ?? null;
       if (def.model) {
         const [provider, ...rest] = def.model.split("/");
@@ -442,9 +422,17 @@ export default function workflow(pi: ExtensionAPI) {
           const usage = (event as { message?: { usage?: { totalTokens?: number } } }).message?.usage;
           if (usage && typeof usage.totalTokens === "number") call.tokens += usage.totalTokens;
           renderWidget();
-          if (call.turns >= def.maxTurns) void session?.abort().catch(() => {});
+          if (call.turns >= def.maxTurns) {
+            call.error = `hit the ${def.maxTurns}-turn limit; partial answer kept`;
+            void session?.abort().catch(() => {});
+          }
         }
       });
+
+      // Third look, after the session exists and is registered: a cancel that
+      // landed during createAgentSession found nothing in `live` to abort, so
+      // nothing would stop this prompt from going out.
+      if (!admitChild(run, call, "prompt")) return null;
 
       await session.prompt(prompt, { source: "extension" } as never);
 
@@ -453,11 +441,13 @@ export default function workflow(pi: ExtensionAPI) {
         const messages = session!.messages as Array<{
           role?: string;
           stopReason?: unknown;
+          errorMessage?: string;
           content?: Array<{ type?: string; text?: string }>;
         }>;
         const last = [...messages].reverse().find((m) => m.role === "assistant");
         return {
           stopReason: last?.stopReason,
+          errorMessage: typeof last?.errorMessage === "string" ? last.errorMessage : undefined,
           text: (last?.content ?? [])
             .filter((c) => c.type === "text" && typeof c.text === "string")
             .map((c) => c.text)
@@ -466,7 +456,7 @@ export default function workflow(pi: ExtensionAPI) {
         };
       };
 
-      let { stopReason, text } = lastAnswer();
+      let { stopReason, errorMessage, text } = lastAnswer();
 
       if (stopReason === "aborted") {
         call.status = "aborted";
@@ -474,6 +464,11 @@ export default function workflow(pi: ExtensionAPI) {
       }
       if (stopReason === "error" || !text) {
         call.status = "error";
+        call.error =
+          stopReason === "error"
+            ? `provider error${errorMessage ? `: ${errorMessage.slice(0, 200)}` : ""}`
+            : "the child answered with no text";
+        run.logs.push(`${call.label}: ${call.error}`);
         return null;
       }
 
@@ -491,11 +486,12 @@ export default function workflow(pi: ExtensionAPI) {
         }
         if (!outcome.ok) {
           call.status = "error";
-          run.logs.push(`${call.label}: schema still unmet — ${outcome.errors.slice(0, 2).join("; ")}`);
+          call.error = `schema still unmet — ${outcome.errors.slice(0, 2).join("; ")}`;
+          run.logs.push(`${call.label}: ${call.error}`);
           renderWidget();
           return null;
         }
-        if (opts.gate && !applyGate(opts.gate, call, workDir, run)) {
+        if (opts.gate && !(await applyGate(opts.gate, call, workDir, run))) {
           call.status = "error";
           renderWidget();
           return null;
@@ -507,7 +503,7 @@ export default function workflow(pi: ExtensionAPI) {
 
       // v0.2 gate: verify the child's work by running a command instead of
       // asking another model (tintinweb). Non-zero exit fails the call.
-      if (opts?.gate && !applyGate(opts.gate, call, workDir, run)) {
+      if (opts?.gate && !(await applyGate(opts.gate, call, workDir, run))) {
         call.status = "error";
         renderWidget();
         return null;
@@ -522,8 +518,13 @@ export default function workflow(pi: ExtensionAPI) {
       worktreeSettled = true;
       const { note } = settleWorktree(ctx.cwd, isolation, call);
       return `${text}\n\n${note}`;
-    } catch {
+    } catch (err) {
+      // "No model available", a worktree that would not create, a session
+      // that would not start: each used to become a bare null. The message is
+      // the only thing the model can act on.
       call.status = "error";
+      call.error = err instanceof Error ? err.message : String(err);
+      run.logs.push(`${call.label}: ${call.error.slice(0, 200)}`);
       return null;
     } finally {
       release();
@@ -663,7 +664,7 @@ export default function workflow(pi: ExtensionAPI) {
     ) {
       const uiCtx = ctx as UiContext;
       if (activeRun?.status === "running") {
-        throw new Error(`Workflow ${activeRun.runId} is still running — wait or poll workflow_status.`);
+        throw new Error(`Workflow ${activeRun.runId} is still running — its result is delivered when it finishes; workflow_status shows progress.`);
       }
 
       let script = params.script ?? "";
@@ -674,7 +675,7 @@ export default function workflow(pi: ExtensionAPI) {
         const dir = join(uiCtx.cwd, ".pi", "workflows");
         // Saved workflows are repo-shipped EXECUTABLE CODE: the script fans
         // out paid child-agent calls and its gate option runs arbitrary shell
-        // through spawnSync. The vm it runs in is cooperative discipline, not
+        // commands. The vm it runs in is cooperative discipline, not
         // a security boundary — the code's old comment that a gate has "the
         // same trust level as the bash tool in this session" is only true
         // when the model wrote the script this session, and the name= path
@@ -780,7 +781,15 @@ export default function workflow(pi: ExtensionAPI) {
             // still works.
           });
         return {
-          content: [{ type: "text", text: `Workflow ${run.runId} started. Poll workflow_status runId="${run.runId}".` }],
+          content: [
+            {
+              type: "text",
+              text:
+                `Workflow ${run.runId} started in the background. Its result is delivered to you when it finishes — ` +
+                `do not poll. workflow_status runId="${run.runId}" shows progress if you need it early. ` +
+                `Esc does not reach a background run; the user stops it with /workflows stop ${run.runId}.`,
+            },
+          ],
           details: { runId: run.runId },
         };
       }
@@ -808,13 +817,25 @@ ${resumeSummary(cursor.reused, cacheSize)}` : "";
     name: "workflow_status",
     label: "Workflow status",
     promptSnippet: "Progress of a running workflow",
-    description: "Progress of a workflow run (default: the latest). Returns the result when finished.",
+    description:
+      "Progress of a workflow run (default: the latest). Returns the result when finished. " +
+      "wait=<seconds> (0–120) holds this call open until the run finishes or the time is up, " +
+      "instead of answering 'still running' at once — useful in a headless session, where nothing is delivered later.",
     parameters: Type.Object({
       runId: Type.Optional(Type.String()),
+      wait: Type.Optional(
+        Type.Number({ description: "Seconds to wait for the run to finish before answering (0–120, default 0)" }),
+      ),
     }),
-    async execute(_id, params: { runId?: string }) {
+    async execute(_id, params: { runId?: string; wait?: number }, signal, _onUpdate, ctx) {
       const run = params.runId ? runs.get(params.runId.trim()) : activeRun ?? [...runs.values()].pop();
       if (!run) throw new Error("No workflow runs this session.");
+      // Clamped, not rejected: a model that asks for 300 gets the ceiling, not
+      // a tool error to retry its way around.
+      const waitMs = Math.min(120, Math.max(0, Number(params.wait) || 0)) * 1000;
+      if (run.status === "running" && waitMs > 0) {
+        await waitUntil(() => run.status !== "running", waitMs, 250, signal);
+      }
       if (run.status === "running") {
         const pending = pendingResult({
           id: run.runId,
@@ -822,13 +843,21 @@ ${resumeSummary(cursor.reused, cacheSize)}` : "";
           startedAt: run.startedAt,
           now: Date.now(),
           collectWith: "workflow_status",
+          // A headless `pi -p` run ends with this turn: "it will be delivered"
+          // is a promise nothing can keep there, so the text says to collect.
+          interactive: (ctx as { hasUI?: boolean }).hasUI !== false,
         });
         // The live phase/agent lines are still worth having; what changes is
-        // that they no longer end in "poll me again".
+        // that they no longer end in "poll me again". Headless, the collect
+        // loop is the only option — so name the parameter that makes it one
+        // call instead of many.
+        const waitHint = pending.details.pollRequired
+          ? `\nPass wait=120 to hold a single workflow_status call open until the run finishes instead of calling repeatedly.`
+          : "";
         return {
           content: [{ type: "text", text: `${formatStatus(run)}
 
-${pending.text}` }],
+${pending.text}${waitHint}` }],
           details: pending.details as never,
         };
       }
@@ -869,12 +898,33 @@ ${pending.text}` }],
     for (const run of runs.values()) {
       if (run.status === "running") cancelRun(run, "session-switch");
     }
+    // cancelRun just re-armed the grace timer; its callback would render into
+    // a ctx that is about to go stale.
+    clearWidgetTimer();
     if (ctx.hasUI) ctx.ui.setWidget("workflow", undefined);
   });
 
   pi.registerCommand("workflows", {
-    description: "List workflow runs and saved scripts (.pi/workflows/)",
-    handler: async (_args, ctx) => {
+    description: "List workflow runs and saved scripts (.pi/workflows/); `stop [runId]` cancels a run",
+    handler: async (args, ctx) => {
+      const [verb, target] = args.trim().split(/\s+/).filter(Boolean);
+      if (verb === "stop") {
+        // A foreground run stops on Esc through the tool's AbortSignal. A
+        // background run outlives its tool call by design, so that signal is
+        // not its cancel button — this is.
+        const run = target ? runs.get(target) : activeRun;
+        if (!run) {
+          notify(ctx, target ? `No workflow run "${target}" this session.` : "No workflow run to stop.", "warning");
+          return;
+        }
+        if (run.status !== "running") {
+          notify(ctx, `Workflow ${run.runId} already finished (${run.status}).`, "info");
+          return;
+        }
+        cancelRun(run, "user-abort");
+        notify(ctx, `Workflow ${run.runId} stopped — ${run.error ?? "cancelled"}`, "info");
+        return;
+      }
       if (!ctx.hasUI) return;
       const saved = savedWorkflows(ctx.cwd);
       const runLines = [...runs.values()].map((r) => formatStatus(r)).join("\n") || "(no runs yet)";

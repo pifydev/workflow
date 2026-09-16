@@ -76,12 +76,23 @@ function branchExists(cwd: string, branch: string): boolean {
   }
 }
 
-/** Note appended to a child's report when it ran isolated. */
+/**
+ * Note appended to a child's report when it ran isolated and left work
+ * behind. That work is UNCOMMITTED unless the child chose to commit — the
+ * builtin worker never does — and @pify/worktree's worktree_merge refuses a
+ * dirty tree, so the old note ("merge with worktree_merge") sent the model to
+ * a tool that would turn it away. Say what state the tree is in and what to
+ * do about it.
+ */
 export function isolationNote(isolation: Isolation): string {
+  const at = `git -C "${isolation.path}"`;
   return [
-    `Ran isolated in worktree ${isolation.path} (branch ${isolation.branch}).`,
-    `The main checkout is untouched. Merge with @pify/worktree's worktree_merge branch="${isolation.branch}",`,
-    `or inspect: cd "${isolation.path}" && git log --stat`,
+    `Ran isolated in worktree ${isolation.path} (branch ${isolation.branch}); the main checkout is untouched.`,
+    `Its changes are in that worktree, uncommitted unless the child committed them. To bring them back:`,
+    `  review:  ${at} status && ${at} diff`,
+    `  commit:  ${at} add -A && ${at} commit -m "<what changed>"`,
+    `  merge:   @pify/worktree's worktree_merge branch="${isolation.branch}" (refuses an uncommitted tree)`,
+    `or discard it: git worktree remove --force "${isolation.path}".`,
   ].join("\n");
 }
 

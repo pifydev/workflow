@@ -44,6 +44,7 @@ return { findings: verified.filter(Boolean) };
 | Parameter | Type | Notes |
 |---|---|---|
 | `runId` | string, optional | Defaults to the most recent run |
+| `wait` | number, optional | Seconds (0–120) to hold the call open until the run finishes before answering. Esc ends the wait |
 
 ## Script globals
 
@@ -110,9 +111,21 @@ Gates: 1 success, 1 no_attestation
 
 `isolation: "worktree"` is the fix rather than the warning: an isolated agent has its own checkout, nobody else can reach it, and its verdict is its own.
 
+Gates run asynchronously: pi is not frozen while a two-minute test suite runs, and a gate that overruns its deadline has its whole process tree killed rather than a parent shell alone.
+
 ### Gate results reach the model
 
 A rejected step makes `agent()` return `null`, and a script's own `.filter(Boolean)` then drops it — leaving the model a shorter array with no hint that anything was rejected or why, which is the one thing a gate exists to say. The ledger above travels with the run result, so the reasons arrive in bytes. A clean, attributable pass costs one word in the tally and no line; only verdicts that change what the reader should do spend one.
+
+The same goes for every other way a step can come back `null`. A child that threw, a provider error, an empty answer, a schema still unmet after its retry, a call cancelled before it started — each is listed under `Failures:` in the result with its reason, so a shorter array never arrives unexplained:
+
+```
+Failures: 1 error, 1 aborted
+  ✗ scout-1 — error: No model available
+  ✗ worker-3 — aborted: cancelled while queued for a slot
+```
+
+A gate rejection is told once, by the gate ledger, not repeated here.
 
 Verified where it has to be true rather than in a fixture — `test/live/gate-wire.mjs` and `test/live/attribution-wire.mjs` read pi's own provider requests and confirm the ledger, the outcome and the reason reach the model, including the shared-tree note from a real `parallel()` race.
 
@@ -125,16 +138,18 @@ It is a prefix, not a lookup table, and that is deliberate: a workflow's later p
 ## Behaviour
 
 - **Determinism is enforced.** Scripts run in a poisoned `node:vm` context where `Date.now()`, `Math.random()`, argless `new Date()`, `eval` and `Function` throw, so control flow stays reproducible and resume means something. This is cooperative discipline, not a security boundary — scripts run at the same trust level as the bash tool.
-- **Stopping stops the children.** Pressing Esc, or switching away from the session, aborts every live child. The script is ordinary JavaScript and cannot be interrupted mid-statement, so a cancelled run instead refuses to start anything new: the next `agent()` returns `null` rather than spawning. A run that reaches the end of its script after being cancelled keeps the cancelled verdict — reporting it as done would claim a result nobody produced.
+- **Stopping stops the children.** A foreground run stops on Esc; a background run outlives its tool call by design, so Esc does not reach it — `/workflows stop [runId]` does. Switching away from the session stops everything. Either way every live child is aborted, and a child still queued behind the concurrency cap, or between getting a session and sending its first prompt, is refused before it starts rather than left to run to completion on a run nobody wants. The script is ordinary JavaScript and cannot be interrupted mid-statement, so a cancelled run instead refuses to start anything new: the next `agent()` returns `null` rather than spawning. A run that reaches the end of its script after being cancelled keeps the cancelled verdict — reporting it as done would claim a result nobody produced — and its result says who stopped it and what that cost (user, timeout or session switch) instead of hiding the cause.
 - **One agent catalog.** `agent()` uses the same `reviewer` / `scout` / `worker` builtins and `.pi/agents/*.md` custom types as [`@pify/subagent`](https://github.com/pifydev/subagent) and [`@pify/swarm`](https://github.com/pifydev/swarm).
 - **Isolated steps clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; anything uncommitted, and any commit the child made, is kept and reported.
 - **Limits.** 20 agents per run, 4 concurrent behind a shared semaphore, and a 10-minute script timeout.
 - **Saved workflows.** `.pi/workflows/<name>.js` runs by name — after you approve the repository's scripts, once per project. These are repo-shipped *executable code*: the script fans out paid child-agent calls and its `gate` option runs shell commands, and the vm it executes in is cooperative discipline, not a security boundary. So the first `name=` run asks, the answer is remembered in `pify-project-consent.json` (scope `workflows`), and a headless run needs `PIFY_TRUST_PROJECT=1`. Project agent definitions under `.pi/agents/` are gated the same way, under the same `agents` answer subagent records. An `export const meta = {…}` prefix is tolerated, so scripts written for other harnesses mostly run unchanged.
-- **Background runs come back to you.** `background: true` returns a `runId`, and when the run finishes its result is **delivered** into the conversation — measured in `test/live/delivery-wire.mjs` (3/3: the background run finished and its result reached the model unasked), which also measures the consent gate in both directions: an unapproved repository's saved workflow is refused with directions, and `PIFY_TRUST_PROJECT=1` lets a trusted headless run proceed. Delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not, so the test holds the session open the way a real one naturally stays open. `workflow_status` still shows the live phase and agent lines, but no longer ends in "poll me again": it returns a structured result with `retryable`, the elapsed time and `pollRequired: false`. Answering "not yet" with a tool *error* would be worse than useless — it invites the model's own retry machinery into a loop over a condition only time resolves. A live widget shows the current phase and its agents; finished runs survive `/reload`.
+- **Background runs come back to you.** `background: true` returns a `runId`, and when the run finishes its result is **delivered** into the conversation — measured in `test/live/delivery-wire.mjs` (3/3: the background run finished and its result reached the model unasked), which also measures the consent gate in both directions: an unapproved repository's saved workflow is refused with directions, and `PIFY_TRUST_PROJECT=1` lets a trusted headless run proceed. Delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not, so the test holds the session open the way a real one naturally stays open. `workflow_status` still shows the live phase and agent lines, but no longer ends in "poll me again": it returns a structured result with `retryable`, the elapsed time and `pollRequired: false`. Answering "not yet" with a tool *error* would be worse than useless — it invites the model's own retry machinery into a loop over a condition only time resolves. Where collecting within the turn is the only option — a headless `pi -p` run — `wait` turns the collect loop into one call: `workflow_status` holds open for up to 120 seconds until the run finishes, and Esc ends the wait. A live widget shows the current phase and its agents, lingers 15 seconds after the run ends so the verdict is seen, then clears; finished runs survive `/reload`.
 
 ## Command
 
 `/workflows` — saved scripts in `.pi/workflows/`, and this session's runs.
+
+`/workflows stop [runId]` — cancel a run (default: the active one). This is how a background run is stopped; a foreground run also stops on Esc.
 
 ## The Pify agent stack
 

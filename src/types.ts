@@ -78,6 +78,14 @@ export interface AgentCallState {
   branch?: string;
   /** What this call's gate proved, when it had one. */
   gate?: GateRecord;
+  /**
+   * Why the call produced no result, when the reason was not a gate: the
+   * error the child threw, a provider error, an empty answer, a schema still
+   * unmet after the retry, or a cancel that landed before it started. A gate
+   * rejection is told by `gate` instead. Without this every one of those was a
+   * silent `null` in the script, and the model saw a shorter array.
+   */
+  error?: string;
 }
 
 /**
