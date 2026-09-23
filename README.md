@@ -36,6 +36,7 @@ return { findings: verified.filter(Boolean) };
 | `script` | string | The orchestration script. Provide this **or** `name` |
 | `name` | string | Run a saved script from `.pi/workflows/<name>.js` |
 | `args` | any, optional | Exposed to the script as the global `args` |
+| `budget` | string or number, optional | Total-token ceiling for the run: `"500k"`, `"1.5m"`, a number, or `"off"`. Defaults to `/workflows budget` |
 | `background` | boolean, optional | Return a `runId` immediately |
 | `resumeFromRunId` | string, optional | Reuse a prior run's results for the unchanged prefix |
 
@@ -56,6 +57,12 @@ return { findings: verified.filter(Boolean) };
 | `phase(title)` | — groups the agents that follow, for the widget and the log |
 | `log(msg)` | — a progress line |
 | `args` | Whatever the tool call passed |
+| `budget` | `{ total, spent(), remaining() }` — the run's token ceiling (`total` is `null` and `remaining()` is `Infinity` when there is none) |
+| `workflow(name, args?)` | A saved workflow run inline as one step, returning whatever it returns — one level of nesting |
+
+A budget is a hard ceiling on the run's total tokens (input and output — the figure this package already tracks per call): once it is reached the next `agent()` throws, children already running finish, and the run ends as an error that says so. Scripts scale themselves with it — `while (budget.total && budget.remaining() > 50_000) { … }` — guarding on `total` so a run with no ceiling does not loop to the agent cap.
+
+`workflow(name, args)` runs `.pi/workflows/<name>.js` as a stage of the current script, so a reusable saved workflow composes instead of being pasted. Its agents are this run's agents: same list, same 20-agent cap, same concurrency semaphore, same cancel, same budget and same resume journal, so it can neither escape the limits nor hide from the record. A saved workflow cannot itself call `workflow()`.
 
 `agent()` options: `agent`, `label`, `phase`, `gate`, `isolation`, `schema`. The script's return value becomes the tool result.
 
@@ -142,7 +149,7 @@ It is a prefix, not a lookup table, and that is deliberate: a workflow's later p
 - **Stopping stops the children.** A foreground run stops on Esc; a background run outlives its tool call by design, so Esc does not reach it — `/workflows stop [runId]` does. Switching away from the session stops everything. Either way every live child is aborted, and a child still queued behind the concurrency cap, or between getting a session and sending its first prompt, is refused before it starts rather than left to run to completion on a run nobody wants. The script is ordinary JavaScript and cannot be interrupted mid-statement, so a cancelled run instead refuses to start anything new: the next `agent()` returns `null` rather than spawning. A run that reaches the end of its script after being cancelled keeps the cancelled verdict — reporting it as done would claim a result nobody produced — and its result says who stopped it and what that cost (user, timeout or session switch) instead of hiding the cause.
 - **One agent catalog.** `agent()` uses the same `reviewer` / `scout` / `worker` builtins and `.pi/agents/*.md` custom types as [`@pify/subagent`](https://github.com/pifydev/subagent) and [`@pify/swarm`](https://github.com/pifydev/swarm).
 - **Isolated steps clean up after themselves.** With `isolation: "worktree"`, a worktree whose child changed nothing is removed along with its branch; anything uncommitted, and any commit the child made, is kept and reported.
-- **Limits.** 20 agents per run, 4 concurrent behind a shared semaphore, and a 10-minute script timeout.
+- **Limits.** 20 agents per run, 4 concurrent behind a shared semaphore, a 10-minute script timeout, and an optional total-token budget (`budget=` on the call, or `/workflows budget 500k` as the default) that stops new `agent()` calls once reached. A stalled provider stream is pi's to end — its HTTP idle timeout (5 minutes by default) aborts a request that stops sending — so this package adds no watchdog of its own on top of the script timeout.
 - **Saved workflows.** `.pi/workflows/<name>.js` runs by name — after you approve the repository's scripts, once per project. These are repo-shipped *executable code*: the script fans out paid child-agent calls and its `gate` option runs shell commands, and the vm it executes in is cooperative discipline, not a security boundary. So the first `name=` run asks, the answer is remembered in `pify-project-consent.json` (scope `workflows`), and a headless run needs `PIFY_TRUST_PROJECT=1`. Project agent definitions under `.pi/agents/` are gated the same way, under the same `agents` answer subagent records. An `export const meta = {…}` prefix is tolerated, so scripts written for other harnesses mostly run unchanged.
 - **Background runs come back to you.** `background: true` returns a `runId`, and when the run finishes its result is **delivered** into the conversation — measured in `test/live/delivery-wire.mjs` (3/3: the background run finished and its result reached the model unasked), which also measures the consent gate in both directions: an unapproved repository's saved workflow is refused with directions, and `PIFY_TRUST_PROJECT=1` lets a trusted headless run proceed. Delivery is a property of sessions that outlive their runs — interactive sessions do, `pi -p` does not, so the test holds the session open the way a real one naturally stays open. `workflow_status` still shows the live phase and agent lines, but no longer ends in "poll me again": it returns a structured result with `retryable`, the elapsed time and `pollRequired: false`. Answering "not yet" with a tool *error* would be worse than useless — it invites the model's own retry machinery into a loop over a condition only time resolves. Where collecting within the turn is the only option — a headless `pi -p` run — `wait` turns the collect loop into one call: `workflow_status` holds open for up to 120 seconds until the run finishes, and Esc ends the wait. A live widget shows the current phase and its agents, lingers 15 seconds after the run ends so the verdict is seen, then clears; finished runs survive `/reload`.
 
@@ -151,6 +158,8 @@ It is a prefix, not a lookup table, and that is deliberate: a workflow's later p
 `/workflows` — saved scripts in `.pi/workflows/`, and this session's runs.
 
 `/workflows stop [runId]` — cancel a run (default: the active one). This is how a background run is stopped; a foreground run also stops on Esc.
+
+`/workflows budget [500k|1.5m|off]` — show or set the default token ceiling for runs that do not pass `budget=` themselves. Stored in `pify-workflow-budget.json` next to the consent file.
 
 ## The Pify agent stack
 

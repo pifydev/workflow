@@ -124,6 +124,8 @@ export interface WorkflowRun {
   runId: string;
   /** Run this one resumed from, when it did (v0.4). */
   resumedFrom?: string;
+  /** Token ceiling the run started with, when it had one (v0.13). */
+  budget?: number;
   background: boolean;
   status: RunStatus;
   startedAt: number;

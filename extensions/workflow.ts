@@ -51,7 +51,8 @@ import {
 } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
-import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions } from "../src/sandbox.ts";
+import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions, type SandboxHooks } from "../src/sandbox.ts";
+import { BudgetExceededError, budgetView, formatBudget, parseBudget } from "../src/budget.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -60,6 +61,7 @@ import {
   type AgentCallState,
   type AgentDef,
   type WorkflowRun,
+  SCRIPT_TIMEOUT_MS,
 } from "../src/types.ts";
 import { attributionNote, normalizeGate, runGate, sharedWith, type GateContract } from "../src/gate.ts";
 
@@ -121,6 +123,63 @@ export default function workflow(pi: ExtensionAPI) {
   /** Where the suite records which projects you approved, and for what. */
   function consentFile(): string {
     return join(getAgentDir(), "pify-project-consent.json");
+  }
+
+  /** The default token ceiling for runs that do not name one; `/workflows budget` sets it. */
+  function budgetFile(): string {
+    return join(getAgentDir(), "pify-workflow-budget.json");
+  }
+  function readDefaultBudget(): number | null {
+    try {
+      const raw = JSON.parse(readFileSync(budgetFile(), "utf8")) as { total?: unknown };
+      return parseBudget(raw?.total ?? null);
+    } catch {
+      return null;
+    }
+  }
+  function writeDefaultBudget(total: number | null): void {
+    writeFileSync(budgetFile(), JSON.stringify({ total }));
+  }
+
+  /**
+   * A saved workflow, by name, after the project's scripts were approved.
+   * Shared by the tool's name= path and a script's nested workflow() call, so
+   * both go through the same name check and the same consent gate.
+   */
+  async function loadSavedScript(uiCtx: UiContext, name: string): Promise<string> {
+    const safe = name.trim().toLowerCase();
+    if (!/^[a-z0-9._-]+$/.test(safe)) throw new Error(`Invalid workflow name "${name}".`);
+    const dir = join(uiCtx.cwd, ".pi", "workflows");
+    // Saved workflows are repo-shipped EXECUTABLE CODE: the script fans
+    // out paid child-agent calls and its gate option runs arbitrary shell
+    // commands. The vm it runs in is cooperative discipline, not
+    // a security boundary — the code's old comment that a gate has "the
+    // same trust level as the bash tool in this session" is only true
+    // when the model wrote the script this session, and the name= path
+    // loads whatever a cloned repository put on disk. memory asks consent
+    // before injecting mere TEXT from a repo; code gets at least that.
+    const allowed = await projectConsent(
+      uiCtx,
+      "workflows",
+      "its own saved workflow scripts, which execute as code with shell-capable gates",
+      dir,
+    );
+    if (!allowed) {
+      throw new Error(
+        `Saved workflows from this repository are not approved. Approve when prompted in the TUI, or set PIFY_TRUST_PROJECT=1 for a headless run you trust.`,
+      );
+    }
+    const file = ["", ".js", ".mjs"].map((ext) => join(dir, safe + ext)).find((f) => {
+      try {
+        return readFileSync(f, "utf8") !== undefined;
+      } catch {
+        return false;
+      }
+    });
+    if (!file) {
+      throw new Error(`No saved workflow "${safe}". Available: ${savedWorkflows(uiCtx.cwd).join(", ") || "(none)"}`);
+    }
+    return readFileSync(file, "utf8");
   }
 
   async function projectConsent(ctx: UiContext, scope: string, what: string, dir: string): Promise<boolean> {
@@ -565,18 +624,41 @@ export default function workflow(pi: ExtensionAPI) {
     args: unknown,
     cursor: ResumeCursor | null = null,
   ): Promise<void> {
+    // One ceiling and one call counter for the run, shared with anything a
+    // nested workflow() starts: the nested script's agent() calls are simply
+    // more calls on this run — same agents list, same semaphore, same cancel,
+    // same resume journal — so it cannot escape the limits or the record.
+    const budget = budgetView(run.budget ?? null, () => run.agents.reduce((n, c) => n + c.tokens, 0));
+    const counter = { calls: 0 };
+    const hooks = (nested: boolean): SandboxHooks => ({
+      agent: (prompt, opts) => runChildAgent(ctx, run, cursor, prompt, opts),
+      log: (message) => {
+        run.logs.push(message.slice(0, 500));
+        renderWidget();
+      },
+      phase: (title) => {
+        run.phases.push(title.slice(0, 100));
+        renderWidget();
+      },
+      ...(nested
+        ? {}
+        : {
+            workflow: async (name: string, nestedArgs: unknown) => {
+              const nestedScript = await loadSavedScript(ctx, name);
+              run.logs.push(`workflow(${name}): nested run`);
+              renderWidget();
+              return runScript(nestedScript, nestedArgs, hooks(true), {
+                budget,
+                counter,
+                // The parent's clock keeps running; the nested run gets what is left of it.
+                timeoutMs: Math.max(1_000, SCRIPT_TIMEOUT_MS - (Date.now() - run.startedAt)),
+              });
+            },
+          }),
+    });
+    if (run.budget) run.logs.push(`budget: ${formatBudget(run.budget)} tokens`);
     try {
-      const value = await runScript(script, args, {
-        agent: (prompt, opts) => runChildAgent(ctx, run, cursor, prompt, opts),
-        log: (message) => {
-          run.logs.push(message.slice(0, 500));
-          renderWidget();
-        },
-        phase: (title) => {
-          run.phases.push(title.slice(0, 100));
-          renderWidget();
-        },
-      });
+      const value = await runScript(script, args, hooks(false), { budget, counter });
       run.result =
         typeof value === "string" ? value : value === undefined ? null : JSON.stringify(value, null, 2);
       if (run.result && run.result.length > MAX_PERSISTED_RESULT_CHARS) {
@@ -594,11 +676,12 @@ export default function workflow(pi: ExtensionAPI) {
       // spawnChildAgent, refuses any the zombie script still tries to start.
       if (err instanceof ScriptTimeoutError && run.status === "running") {
         cancelRun(run, "timeout");
-      } else if (err instanceof UnsettledAgentsError && run.status === "running") {
-        // The body returned with children still running: their results have
-        // no one to receive them, so stop them rather than let them finish
-        // as paid work nobody reads. The run is an error, not a cancellation
-        // — the script itself is wrong, and the message says how.
+      } else if ((err instanceof UnsettledAgentsError || err instanceof BudgetExceededError) && run.status === "running") {
+        // The body returned with children still running, or the budget ran
+        // out mid-fan-out: their results have no one to receive them, so
+        // stop them rather than let them finish as paid work nobody reads.
+        // The run is an error, not a cancellation — the script (or its
+        // budget) is what ended it, and the message says how.
         const stopped = live.abortRun(run.runId);
         for (const call of run.agents) {
           if (call.status === "running") {
@@ -654,11 +737,20 @@ export default function workflow(pi: ExtensionAPI) {
       "schema=<JSON Schema> makes the child answer with data — agent() then resolves the validated object " +
       "(one retry on mismatch, null if it still fails), so scripts never parse prose. " +
       "resumeFromRunId replays a prior run's agent results for as long as the calls match, then runs live — " +
-      "edit a script and re-run it without paying for the steps that did not change.",
+      "edit a script and re-run it without paying for the steps that did not change. " +
+      "budget=\"500k\" caps the run's total tokens (hard: agent() refuses once reached); the script sees " +
+      "budget.total/spent()/remaining() and can scale itself with it. " +
+      "workflow(name, args?) inside a script runs a saved workflow inline as one step (one level of nesting), " +
+      "sharing this run's agents, cap, cancel and budget.",
     parameters: Type.Object({
       script: Type.Optional(Type.String({ description: "JavaScript orchestration script body" })),
       name: Type.Optional(Type.String({ description: "Saved workflow name in .pi/workflows/" })),
       args: Type.Optional(Type.Unknown({ description: "Value exposed to the script as `args`" })),
+      budget: Type.Optional(
+        Type.Union([Type.String(), Type.Number()], {
+          description: 'Total-token ceiling for this run: "500k", "1.5m", a number, or "off" (default: /workflows budget)',
+        }),
+      ),
       background: Type.Optional(Type.Boolean()),
       resumeFromRunId: Type.Optional(
         Type.String({ description: "Reuse a prior run's agent results for the unchanged prefix" }),
@@ -670,6 +762,7 @@ export default function workflow(pi: ExtensionAPI) {
         script?: string;
         name?: string;
         args?: unknown;
+        budget?: string | number;
         background?: boolean;
         resumeFromRunId?: string;
       },
@@ -685,43 +778,11 @@ export default function workflow(pi: ExtensionAPI) {
       let script = params.script ?? "";
       if (params.name) {
         if (script) throw new Error("Provide script OR name, not both.");
-        const safe = params.name.trim().toLowerCase();
-        if (!/^[a-z0-9._-]+$/.test(safe)) throw new Error(`Invalid workflow name "${params.name}".`);
-        const dir = join(uiCtx.cwd, ".pi", "workflows");
-        // Saved workflows are repo-shipped EXECUTABLE CODE: the script fans
-        // out paid child-agent calls and its gate option runs arbitrary shell
-        // commands. The vm it runs in is cooperative discipline, not
-        // a security boundary — the code's old comment that a gate has "the
-        // same trust level as the bash tool in this session" is only true
-        // when the model wrote the script this session, and the name= path
-        // loads whatever a cloned repository put on disk. memory asks consent
-        // before injecting mere TEXT from a repo; code gets at least that.
-        const allowed = await projectConsent(
-          uiCtx,
-          "workflows",
-          "its own saved workflow scripts, which execute as code with shell-capable gates",
-          dir,
-        );
-        if (!allowed) {
-          throw new Error(
-            `Saved workflows from this repository are not approved. Approve when prompted in the TUI, or set PIFY_TRUST_PROJECT=1 for a headless run you trust.`,
-          );
-        }
-        const file = ["", ".js", ".mjs"].map((ext) => join(dir, safe + ext)).find((f) => {
-          try {
-            return readFileSync(f, "utf8") !== undefined;
-          } catch {
-            return false;
-          }
-        });
-        if (!file) {
-          throw new Error(
-            `No saved workflow "${safe}". Available: ${savedWorkflows(uiCtx.cwd).join(", ") || "(none)"}`,
-          );
-        }
-        script = readFileSync(file, "utf8");
+        script = await loadSavedScript(uiCtx, params.name);
       }
       if (!script.trim()) throw new Error("workflow requires a script (or a saved name).");
+      // A bad budget is a caller error before anything is spent, not after.
+      const budget = params.budget !== undefined ? parseBudget(params.budget) : readDefaultBudget();
 
       // v0.4 resume: rebuild the prior run's reusable prefix.
       let cursor: ResumeCursor | null = null;
@@ -743,6 +804,7 @@ export default function workflow(pi: ExtensionAPI) {
       const run: WorkflowRun = {
         runId: `w${runCounter}`,
         ...(resumeId ? { resumedFrom: resumeId } : {}),
+        ...(budget !== null ? { budget } : {}),
         background: params.background === true,
         status: "running",
         startedAt: Date.now(),
@@ -920,9 +982,31 @@ ${pending.text}${waitHint}` }],
   });
 
   pi.registerCommand("workflows", {
-    description: "List workflow runs and saved scripts (.pi/workflows/); `stop [runId]` cancels a run",
+    description:
+      "List workflow runs and saved scripts (.pi/workflows/); `stop [runId]` cancels a run; `budget [500k|off]` shows or sets the default token ceiling",
     handler: async (args, ctx) => {
       const [verb, target] = args.trim().split(/\s+/).filter(Boolean);
+      if (verb === "budget") {
+        if (target === undefined) {
+          notify(ctx, `Default workflow budget: ${formatBudget(readDefaultBudget())} tokens (per run; a tool call's budget= overrides it).`, "info");
+          return;
+        }
+        let total: number | null;
+        try {
+          total = parseBudget(target);
+        } catch (err) {
+          notify(ctx, err instanceof Error ? err.message : String(err), "warning");
+          return;
+        }
+        try {
+          writeDefaultBudget(total);
+        } catch (err) {
+          notify(ctx, `Could not save the budget: ${err instanceof Error ? err.message : String(err)}`, "warning");
+          return;
+        }
+        notify(ctx, `Default workflow budget set to ${formatBudget(total)} tokens.`, "info");
+        return;
+      }
       if (verb === "stop") {
         // A foreground run stops on Esc through the tool's AbortSignal. A
         // background run outlives its tool call by design, so that signal is

@@ -1,5 +1,6 @@
 import vm from "node:vm";
 import { MAX_AGENTS_PER_RUN, SCRIPT_TIMEOUT_MS } from "./types.ts";
+import { assertBudget, budgetView, type BudgetView } from "./budget.ts";
 
 /**
  * Deterministic script sandbox (tintinweb's discipline, Claude Code's
@@ -36,6 +37,12 @@ export interface SandboxHooks {
   agent(prompt: string, opts?: AgentOptions): Promise<unknown>;
   log(message: string): void;
   phase(title: string): void;
+  /**
+   * Run a saved workflow inline as one step of this script, sharing the
+   * run's agents, cap, semaphore, cancel and budget. Absent inside a nested
+   * script: nesting is one level, so a saved workflow cannot call another.
+   */
+  workflow?(name: string, args: unknown): Promise<unknown>;
 }
 
 function poisonedMath(): Math {
@@ -83,6 +90,10 @@ export function stripExports(script: string): string {
 export interface RunScriptOptions {
   timeoutMs?: number;
   maxAgents?: number;
+  /** The run's ceiling; shared with a nested workflow() so it cannot escape it. */
+  budget?: BudgetView;
+  /** The run's agent() count; shared with a nested workflow() for the same reason. */
+  counter?: { calls: number };
 }
 
 /**
@@ -116,7 +127,8 @@ export async function runScript(
   options: RunScriptOptions = {},
 ): Promise<unknown> {
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
-  let agentCalls = 0;
+  const counter = options.counter ?? { calls: 0 };
+  const budget = options.budget ?? budgetView(null, () => 0);
   // Every agent() promise still in flight; whatever is left when the body
   // returns was never awaited.
   const inFlight = new Set<Promise<unknown>>();
@@ -125,10 +137,11 @@ export async function runScript(
     if (typeof prompt !== "string" || !prompt.trim()) {
       throw new Error("agent() requires a non-empty prompt string.");
     }
-    agentCalls++;
-    if (agentCalls > maxAgents) {
+    counter.calls++;
+    if (counter.calls > maxAgents) {
       throw new Error(`Agent cap reached (${maxAgents} per run).`);
     }
+    assertBudget(budget);
     const call = hooks.agent(prompt, opts);
     inFlight.add(call);
     const settled = () => inFlight.delete(call);
@@ -158,14 +171,31 @@ export async function runScript(
     );
   };
 
+  const workflow = (name: unknown, nestedArgs?: unknown): Promise<unknown> => {
+    if (typeof name !== "string" || !name.trim()) {
+      return Promise.reject(new Error("workflow() requires a saved workflow name."));
+    }
+    if (!hooks.workflow) {
+      return Promise.reject(new Error("workflow() nests one level only: a saved workflow cannot call another."));
+    }
+    return hooks.workflow(name, nestedArgs);
+  };
+
   const context = vm.createContext(
     {
       agent,
       parallel,
       pipeline,
+      workflow,
       phase: (title: unknown) => hooks.phase(String(title)),
       log: (message: unknown) => hooks.log(String(message)),
       args,
+      // Read-only view; the ceiling is fixed for the run, the counters live.
+      budget: Object.freeze({
+        total: budget.total,
+        spent: () => budget.spent(),
+        remaining: () => budget.remaining(),
+      }),
       JSON,
       Math: poisonedMath(),
       Date: poisonedDate(),

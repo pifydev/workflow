@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { runScript, ScriptTimeoutError, UnsettledAgentsError, stripExports, type SandboxHooks } from "../src/sandbox.ts";
+import { BudgetExceededError, budgetView, formatBudget, parseBudget } from "../src/budget.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import type { ThemeLike, WorkflowRun } from "../src/types.ts";
 
@@ -231,4 +232,77 @@ test("awaited agent() calls — directly or through parallel()/pipeline() — ne
   // A rejected agent() that was awaited (and caught) also counts as settled.
   const failing: SandboxHooks = { ...h, agent: async () => { throw new Error("boom"); } };
   assert.equal(await runScript('try { await agent("a"); } catch { return "caught"; }', undefined, failing), "caught");
+});
+
+test("parseBudget reads k/m suffixes, numbers and off; rejects nonsense", () => {
+  assert.equal(parseBudget("500k"), 500_000);
+  assert.equal(parseBudget("1.5m"), 1_500_000);
+  assert.equal(parseBudget("250000"), 250_000);
+  assert.equal(parseBudget(250_000), 250_000);
+  assert.equal(parseBudget("off"), null);
+  assert.equal(parseBudget(undefined), null);
+  assert.throws(() => parseBudget("lots"), /Invalid budget/);
+  assert.throws(() => parseBudget(-5), /Invalid budget/);
+  assert.equal(formatBudget(500_000), "500k");
+  assert.equal(formatBudget(1_500_000), "1.5m");
+  assert.equal(formatBudget(null), "off");
+});
+
+test("budget: the script sees total/spent/remaining, and agent() refuses once the ceiling is reached", async () => {
+  let spent = 0;
+  const h = hooks({
+    agent: async () => {
+      spent += 40_000;
+      return "r";
+    },
+  });
+  const budget = budgetView(100_000, () => spent);
+  // Two calls fit (0 and 40k spent at entry); the third finds 80k < 100k and
+  // runs; the fourth finds 120k >= 100k and is refused.
+  const result = await runScript(
+    'const seen = [budget.total, budget.remaining()]; await agent("a"); await agent("b"); await agent("c"); seen.push(budget.spent(), budget.remaining()); return seen;',
+    undefined,
+    h,
+    { budget },
+  );
+  assert.deepEqual(result, [100_000, 100_000, 120_000, 0]);
+  await assert.rejects(() => runScript('await agent("d"); return 1;', undefined, h, { budget }), (err: unknown) => {
+    assert.ok(err instanceof BudgetExceededError);
+    assert.match(err.message, /Token budget of 100k exhausted/);
+    return true;
+  });
+  // No ceiling: remaining() is Infinity and nothing is refused.
+  const free = await runScript("return [budget.total, budget.remaining()];", undefined, hooks());
+  assert.deepEqual(free, [null, Number.POSITIVE_INFINITY]);
+  // The loop-until-budget pattern from the README terminates on its own.
+  spent = 0;
+  const loops = await runScript(
+    'let n = 0; while (budget.total && budget.remaining() > 50_000) { await agent("x"); n++; } return n;',
+    undefined,
+    h,
+    { budget: budgetView(100_000, () => spent) },
+  );
+  assert.equal(loops, 2);
+});
+
+test("workflow(): a nested saved workflow runs through the hook, shares the agent cap, and cannot nest twice", async () => {
+  const counter = { calls: 0 };
+  const inner = 'return [await agent("inner-1"), await agent("inner-2"), args];';
+  const h = hooks({
+    workflow: (name, nestedArgs) =>
+      runScript(inner, nestedArgs, { ...hooks(), agent: h.agent, workflow: undefined }, { counter, maxAgents: 3 }),
+  });
+  const result = await runScript(
+    'const a = await agent("outer"); const b = await workflow("child", { k: 1 }); return [a, b];',
+    undefined,
+    h,
+    { counter, maxAgents: 3 },
+  );
+  assert.deepEqual(result, ["report for: outer", ["report for: inner-1", "report for: inner-2", { k: 1 }]]);
+  assert.equal(counter.calls, 3, "outer + two inner calls share one counter");
+  // One more anywhere trips the shared cap.
+  await assert.rejects(() => runScript('return await agent("over");', undefined, h, { counter, maxAgents: 3 }), /Agent cap reached/);
+  // Without the hook (a nested script), workflow() is refused.
+  await assert.rejects(() => runScript('return await workflow("x");', undefined, hooks()), /nests one level only/);
+  await assert.rejects(() => runScript("return await workflow();", undefined, h), /requires a saved workflow name/);
 });
