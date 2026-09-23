@@ -50,6 +50,11 @@ function poisonedMath(): Math {
 
 function poisonedDate(): DateConstructor {
   return new Proxy(Date, {
+    // `Date()` called as a plain function returns the live time as a string —
+    // the same nondeterminism as `new Date()`, through a different trap.
+    apply() {
+      throw new Error("Date() without arguments is unavailable in workflow scripts (determinism).");
+    },
     construct(target, args: unknown[]) {
       if (args.length === 0) {
         throw new Error("new Date() without arguments is unavailable in workflow scripts (determinism).");
@@ -88,6 +93,22 @@ export interface RunScriptOptions {
  */
 export class ScriptTimeoutError extends Error {}
 
+/**
+ * Thrown when the script body returned while agent() calls it started were
+ * still running: a forgotten `await` in a loop, or an early `return`. Without
+ * this the run is recorded done with those results silently dropped while the
+ * children keep spending. Distinct so the caller can stop the orphans.
+ */
+export class UnsettledAgentsError extends Error {
+  readonly count: number;
+  constructor(count: number) {
+    super(
+      `Workflow returned before ${count} agent() call${count === 1 ? "" : "s"} settled — every agent() must be awaited (directly, or through parallel()/pipeline()) before the script returns.`,
+    );
+    this.count = count;
+  }
+}
+
 export async function runScript(
   script: string,
   args: unknown,
@@ -96,6 +117,9 @@ export async function runScript(
 ): Promise<unknown> {
   const maxAgents = options.maxAgents ?? MAX_AGENTS_PER_RUN;
   let agentCalls = 0;
+  // Every agent() promise still in flight; whatever is left when the body
+  // returns was never awaited.
+  const inFlight = new Set<Promise<unknown>>();
 
   const agent = (prompt: unknown, opts?: AgentOptions): Promise<unknown> => {
     if (typeof prompt !== "string" || !prompt.trim()) {
@@ -105,7 +129,11 @@ export async function runScript(
     if (agentCalls > maxAgents) {
       throw new Error(`Agent cap reached (${maxAgents} per run).`);
     }
-    return hooks.agent(prompt, opts);
+    const call = hooks.agent(prompt, opts);
+    inFlight.add(call);
+    const settled = () => inFlight.delete(call);
+    call.then(settled, settled);
+    return call;
   };
 
   const parallel = (thunks: Array<() => Promise<unknown>>): Promise<unknown[]> => {
@@ -166,7 +194,7 @@ export async function runScript(
   const timeoutMs = options.timeoutMs ?? SCRIPT_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await Promise.race([
+    const value = await Promise.race([
       promise,
       new Promise((_resolve, reject) => {
         timer = setTimeout(
@@ -175,6 +203,8 @@ export async function runScript(
         );
       }),
     ]);
+    if (inFlight.size > 0) throw new UnsettledAgentsError(inFlight.size);
+    return value;
   } finally {
     if (timer) clearTimeout(timer);
   }

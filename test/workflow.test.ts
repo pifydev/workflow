@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { runScript, ScriptTimeoutError, stripExports, type SandboxHooks } from "../src/sandbox.ts";
+import { runScript, ScriptTimeoutError, UnsettledAgentsError, stripExports, type SandboxHooks } from "../src/sandbox.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import type { ThemeLike, WorkflowRun } from "../src/types.ts";
 
@@ -76,6 +76,8 @@ test("determinism poisons: Date.now, Math.random, argless new Date throw", async
   await assert.rejects(() => runScript("return Date.now();", undefined, h), /Date\.now/);
   await assert.rejects(() => runScript("return Math.random();", undefined, h), /Math\.random/);
   await assert.rejects(() => runScript("return new Date();", undefined, h), /new Date\(\)/);
+  // Called as a plain function, Date() is the same live clock through the apply trap.
+  await assert.rejects(() => runScript("return Date();", undefined, h), /Date\(\)/);
   // Date WITH args still works (timestamps passed via args).
   const ok = await runScript("return new Date(args.ts).getFullYear();", { ts: Date.UTC(2026, 0, 1) }, h);
   assert.equal(ok, 2026);
@@ -191,4 +193,42 @@ test("widget shows phase, agents, and last log; stale hides", () => {
   assert.ok(text.includes("3 findings"));
   assert.deepEqual(buildWidgetLines(run(), theme, 100_000), []);
   assert.deepEqual(buildWidgetLines(null, theme, 0), []);
+});
+
+test("a script that returns before its agent() calls settle fails loudly instead of dropping their results", async () => {
+  let resolveChild: (v: unknown) => void = () => {};
+  const h: SandboxHooks = {
+    agent: () => new Promise((resolve) => (resolveChild = resolve)),
+    log: () => {},
+    phase: () => {},
+  };
+  // The forgotten-await shape: the agent() promise is created and abandoned.
+  const run = runScript('agent("slow child"); return "early";', undefined, h);
+  await assert.rejects(run, (err: unknown) => {
+    assert.ok(err instanceof UnsettledAgentsError);
+    assert.equal(err.count, 1);
+    assert.match(err.message, /returned before 1 agent\(\) call settled/);
+    return true;
+  });
+  resolveChild("late");
+});
+
+test("awaited agent() calls — directly or through parallel()/pipeline() — never trip the unsettled check", async () => {
+  const h: SandboxHooks = {
+    agent: async (prompt) => `done:${prompt}`,
+    log: () => {},
+    phase: () => {},
+  };
+  assert.equal(await runScript('return await agent("a");', undefined, h), "done:a");
+  assert.deepEqual(
+    await runScript('return await parallel([() => agent("a"), () => agent("b")]);', undefined, h),
+    ["done:a", "done:b"],
+  );
+  assert.deepEqual(
+    await runScript('return await pipeline(["x"], (item) => agent(item));', undefined, h),
+    ["done:x"],
+  );
+  // A rejected agent() that was awaited (and caught) also counts as settled.
+  const failing: SandboxHooks = { ...h, agent: async () => { throw new Error("boom"); } };
+  assert.equal(await runScript('try { await agent("a"); } catch { return "caught"; }', undefined, failing), "caught");
 });

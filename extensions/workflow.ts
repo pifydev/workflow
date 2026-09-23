@@ -51,7 +51,7 @@ import {
 } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
-import { runScript, ScriptTimeoutError, type AgentOptions } from "../src/sandbox.ts";
+import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions } from "../src/sandbox.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -594,6 +594,21 @@ export default function workflow(pi: ExtensionAPI) {
       // spawnChildAgent, refuses any the zombie script still tries to start.
       if (err instanceof ScriptTimeoutError && run.status === "running") {
         cancelRun(run, "timeout");
+      } else if (err instanceof UnsettledAgentsError && run.status === "running") {
+        // The body returned with children still running: their results have
+        // no one to receive them, so stop them rather than let them finish
+        // as paid work nobody reads. The run is an error, not a cancellation
+        // — the script itself is wrong, and the message says how.
+        const stopped = live.abortRun(run.runId);
+        for (const call of run.agents) {
+          if (call.status === "running") {
+            call.status = "aborted";
+            call.error ??= "the script returned before this call settled";
+          }
+        }
+        run.status = "error";
+        run.error = `${err.message} ${stopped === 0 ? "" : `(${stopped} child agent${stopped === 1 ? "" : "s"} stopped)`}`.trim();
+        run.logs.push(run.error);
       } else if (run.status !== "cancelled") {
         run.status = "error";
         run.error = err instanceof Error ? err.message : String(err);
