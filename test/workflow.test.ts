@@ -265,15 +265,18 @@ test("budget: the script sees total/spent/remaining, and agent() refuses once th
     h,
     { budget },
   );
-  assert.deepEqual(result, [100_000, 100_000, 120_000, 0]);
+  // Values cross the vm boundary with the context's own Array prototype, so
+  // compare their shape, not their realm.
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), [100_000, 100_000, 120_000, 0]);
   await assert.rejects(() => runScript('await agent("d"); return 1;', undefined, h, { budget }), (err: unknown) => {
     assert.ok(err instanceof BudgetExceededError);
     assert.match(err.message, /Token budget of 100k exhausted/);
     return true;
   });
   // No ceiling: remaining() is Infinity and nothing is refused.
-  const free = await runScript("return [budget.total, budget.remaining()];", undefined, hooks());
-  assert.deepEqual(free, [null, Number.POSITIVE_INFINITY]);
+  const free = (await runScript("return [budget.total, budget.remaining()];", undefined, hooks())) as unknown[];
+  assert.equal(free[0], null);
+  assert.equal(free[1], Number.POSITIVE_INFINITY);
   // The loop-until-budget pattern from the README terminates on its own.
   spent = 0;
   const loops = await runScript(
@@ -298,7 +301,7 @@ test("workflow(): a nested saved workflow runs through the hook, shares the agen
     h,
     { counter, maxAgents: 3 },
   );
-  assert.deepEqual(result, ["report for: outer", ["report for: inner-1", "report for: inner-2", { k: 1 }]]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), ["report for: outer", ["report for: inner-1", "report for: inner-2", { k: 1 }]]);
   assert.equal(counter.calls, 3, "outer + two inner calls share one counter");
   // One more anywhere trips the shared cap.
   await assert.rejects(() => runScript('return await agent("over");', undefined, h, { counter, maxAgents: 3 }), /Agent cap reached/);
