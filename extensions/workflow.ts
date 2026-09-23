@@ -53,6 +53,7 @@ import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions, type SandboxHooks } from "../src/sandbox.ts";
 import { BudgetExceededError, budgetView, formatBudget, parseBudget } from "../src/budget.ts";
+import { addChildSpend } from "../src/child-cost.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -478,8 +479,12 @@ export default function workflow(pi: ExtensionAPI) {
       unsubscribe = session.subscribe((event) => {
         if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
           call.turns++;
-          const usage = (event as { message?: { usage?: { totalTokens?: number } } }).message?.usage;
+          const usage = (event as { message?: { usage?: { totalTokens?: number; cost?: { total?: number } } } }).message
+            ?.usage;
           if (usage && typeof usage.totalTokens === "number") call.tokens += usage.totalTokens;
+          // A child's spend never reaches the parent's branch; tell the
+          // suite-wide tally so @pify/usage can show it beside the session cost.
+          if (usage) addChildSpend("workflow", { cost: usage.cost?.total, tokens: usage.totalTokens });
           renderWidget();
           if (call.turns >= def.maxTurns) {
             call.error = `hit the ${def.maxTurns}-turn limit; partial answer kept`;
