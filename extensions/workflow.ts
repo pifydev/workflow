@@ -47,13 +47,15 @@ import { DELIVERY_TYPE, deliveryMessage, pendingResult } from "../src/pending.ts
 import {
   createIsolationWorktree,
   settleWorktree,
-  type Isolation,
-} from "../src/isolate.ts";
+  type Isolation, isolationPromptNote, repoToplevel } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
 import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions, type SandboxHooks } from "../src/sandbox.ts";
 import { BudgetExceededError, budgetView, formatBudget, parseBudget } from "../src/budget.ts";
 import { addChildSpend } from "../src/child-cost.ts";
+import { childTokens } from "../src/tokens.ts";
+import { resolveChildModel } from "../src/child-model.ts";
+import { findPinnedModel } from "../src/model-match.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -426,12 +428,22 @@ export default function workflow(pi: ExtensionAPI) {
 
       let model = ctx.model ?? null;
       if (def.model) {
-        const [provider, ...rest] = def.model.split("/");
-        const found =
-          provider && rest.length > 0 ? ctx.modelRegistry.find(provider, rest.join("/")) : undefined;
-        if (found) model = found;
+        // Exact, then normalized-exact within the provider; a miss used to be
+        // silent here and the call ran on the parent session's model.
+        const pinned = findPinnedModel(ctx.modelRegistry, def.model);
+        if (pinned.model) model = pinned.model;
+        else {
+          run.logs.push(`${call.label}: ${pinned.reason} — using session model`);
+          notify(ctx, `workflow ${run.runId} ${call.label}: ${pinned.reason} — using session model`, "warning");
+        }
       }
       if (!model) throw new Error("No model available");
+      // pi 0.99: a virtual selection cannot drive a child session (the fresh
+      // runtime inside createAgentSession has no router); take the physical
+      // model the host last routed to. See src/child-model.ts.
+      const resolved = resolveChildModel(model, ctx.sessionManager.getBranch() as unknown[], (p, i) => ctx.modelRegistry.find(p, i));
+      if (!resolved.ok) throw new Error(resolved.reason);
+      model = resolved.model;
 
       // v0.2: worktree isolation for mutating steps.
       if (opts?.isolation === "worktree") {
@@ -463,6 +475,8 @@ export default function workflow(pi: ExtensionAPI) {
           def.systemPrompt,
           "You are one step of a scripted workflow. Your final assistant message IS the value returned to the script — return raw data/report, no pleasantries, no questions.",
           ...(opts?.schema ? [schemaInstruction(opts.schema)] : []),
+          // Isolated: say which tree is writable (tools take absolute paths).
+          ...(isolation ? [isolationPromptNote(isolation.path, repoToplevel(ctx.cwd))] : []),
         ],
       });
       await loader.reload();
@@ -479,12 +493,19 @@ export default function workflow(pi: ExtensionAPI) {
       unsubscribe = session.subscribe((event) => {
         if (event.type === "message_end" && (event as { message?: { role?: string } }).message?.role === "assistant") {
           call.turns++;
-          const usage = (event as { message?: { usage?: { totalTokens?: number; cost?: { total?: number } } } }).message
-            ?.usage;
-          if (usage && typeof usage.totalTokens === "number") call.tokens += usage.totalTokens;
+          const usage = (
+            event as {
+              message?: {
+                usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: { total?: number } };
+              };
+            }
+          ).message?.usage;
+          // input + output + cacheWrite: totalTokens would count the cached
+          // prefix once per turn and trip the run budget early (src/tokens.ts).
+          if (usage) call.tokens += childTokens(usage);
           // A child's spend never reaches the parent's branch; tell the
           // suite-wide tally so @pify/usage can show it beside the session cost.
-          if (usage) addChildSpend("workflow", { cost: usage.cost?.total, tokens: usage.totalTokens });
+          if (usage) addChildSpend("workflow", { cost: usage.cost?.total, tokens: childTokens(usage) });
           renderWidget();
           if (call.turns >= def.maxTurns) {
             call.error = `hit the ${def.maxTurns}-turn limit; partial answer kept`;

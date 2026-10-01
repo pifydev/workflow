@@ -3,10 +3,12 @@
  *
  * The 20-agent cap bounds a run by count, which says nothing about cost: one
  * child can spend more than ten. A budget is denominated in the tokens this
- * package already tracks per call (usage.totalTokens — input and output
- * together, so the ceiling is a TOTAL-token one, not output-only). It is a
- * hard ceiling: once spent >= total, the next agent() refuses; children
- * already running finish. Scripts read it to scale their own depth:
+ * package tracks per call: input + output + cacheWrite of every child
+ * message (see src/tokens.ts — never cacheRead, which is the cached prefix
+ * read back on every turn and would count it once per turn). So the ceiling
+ * is a work-token one, not output-only. It is a hard ceiling: once spent >=
+ * total, the next agent() refuses; children already running finish. Scripts
+ * read it to scale their own depth:
  *
  *   while (budget.total && budget.remaining() > 50_000) { ... }
  *
