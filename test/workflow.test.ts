@@ -309,3 +309,88 @@ test("workflow(): a nested saved workflow runs through the hook, shares the agen
   await assert.rejects(() => runScript('return await workflow("x");', undefined, hooks()), /nests one level only/);
   await assert.rejects(() => runScript("return await workflow();", undefined, h), /requires a saved workflow name/);
 });
+
+test("loopUntilDry deduplicates across rounds, stops after two dry rounds, and lets errors propagate", async () => {
+  const rounds: number[] = [];
+  const r = await runScript(
+    `const seen = []; const out = await loopUntilDry({
+      round: async (n) => { args.rounds.push(n); return n === 0 ? ["a", "b"] : n === 1 ? ["b", "c"] : ["a", "c"]; },
+    }); return out;`,
+    { rounds },
+    hooks(),
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), ["a", "b", "c"]);
+  assert.deepEqual(rounds, [0, 1, 2, 3], "round 2 and 3 were dry, then it stopped");
+  const capped = await runScript(`return await loopUntilDry({ round: async (n) => [n], maxRounds: 3 });`, undefined, hooks());
+  assert.deepEqual(JSON.parse(JSON.stringify(capped)), [0, 1, 2]);
+  await assert.rejects(() => runScript(`return await loopUntilDry({ round: async () => { throw new Error("budget gone"); } });`, undefined, hooks()), /budget gone/);
+  await assert.rejects(() => runScript(`return await loopUntilDry({});`, undefined, hooks()), /requires a round/);
+});
+
+test("verify asks each reviewer to refute, counts the vote, and lenses give them distinct angles", async () => {
+  const prompts: string[] = [];
+  const h = hooks({
+    agent: async (prompt, opts) => {
+      prompts.push(prompt);
+      // The security lens refutes; the other two uphold.
+      return { refuted: String(opts?.label).includes("security"), reasoning: "because" };
+    },
+  });
+  const r = (await runScript(
+    `return await verify("the limiter is thread-safe", { lens: ["correctness", "security", "reproduces"] });`,
+    undefined,
+    h,
+  )) as { ok: boolean; upheld: number; refuted: number; reviewers: number; threshold: number };
+  assert.equal(r.reviewers, 3);
+  assert.equal(r.threshold, 2);
+  assert.equal(r.upheld, 2);
+  assert.equal(r.refuted, 1);
+  assert.equal(r.ok, true);
+  assert.ok(prompts.every((p) => /Try to REFUTE/.test(p)));
+  assert.ok(prompts.some((p) => /security lens/.test(p)));
+  const strict = (await runScript(`return await verify("x", { reviewers: 3, threshold: 3 });`, undefined, h)) as { ok: boolean };
+  assert.equal(strict.ok, true, "no security lens → nobody refutes → unanimous");
+});
+
+test("refine retries with the validator's feedback and reports the last value when it never passes", async () => {
+  const r = (await runScript(
+    `const seen = [];
+     const out = await refine(
+       async (feedback, attempt) => { seen.push(feedback); return attempt + 1; },
+       async (value) => (value >= 3 ? true : "need at least 3"),
+       { attempts: 5 },
+     );
+     return { out, seen };`,
+    undefined,
+    hooks(),
+  )) as { out: { ok: boolean; value: number; attempts: number }; seen: Array<string | null> };
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), { out: { ok: true, value: 3, attempts: 3 }, seen: [null, "need at least 3", "need at least 3"] });
+  const never = (await runScript(
+    `return await refine(async () => "draft", async () => ({ ok: false, feedback: "no" }), { attempts: 2 });`,
+    undefined,
+    hooks(),
+  )) as { ok: boolean; attempts: number; feedback: string };
+  assert.equal(never.ok, false);
+  assert.equal(never.attempts, 2);
+  assert.equal(never.feedback, "no");
+});
+
+test("checkpoint goes through the host hook with its options, and is refused where no host can ask", async () => {
+  const asked: Array<{ prompt: string; opts: unknown }> = [];
+  const h = hooks({
+    checkpoint: async (prompt, opts) => {
+      asked.push({ prompt, opts });
+      return opts.kind === "select" ? "ship" : true;
+    },
+  });
+  const r = await runScript(
+    `const go = await checkpoint("Deploy now?"); const how = await checkpoint("How?", { kind: "select", choices: ["ship", "hold"], default: "hold" }); return [go, how];`,
+    undefined,
+    h,
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(r)), [true, "ship"]);
+  assert.equal(asked.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(asked[1]!.opts)), { kind: "select", choices: ["ship", "hold"], default: "hold" });
+  await assert.rejects(() => runScript(`return await checkpoint("x");`, undefined, hooks()), /no host can ask/);
+  await assert.rejects(() => runScript(`return await checkpoint("");`, undefined, h), /requires a prompt/);
+});

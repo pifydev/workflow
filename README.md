@@ -59,10 +59,16 @@ return { findings: verified.filter(Boolean) };
 | `args` | Whatever the tool call passed |
 | `budget` | `{ total, spent(), remaining() }` — the run's token ceiling (`total` is `null` and `remaining()` is `Infinity` when there is none) |
 | `workflow(name, args?)` | A saved workflow run inline as one step, returning whatever it returns — one level of nesting |
+| `loopUntilDry({ round, key?, consecutiveEmpty?, maxRounds? })` | Everything `round(n)` found, deduplicated across rounds, once `consecutiveEmpty` (2) rounds in a row found nothing new or `maxRounds` (50) ran |
+| `verify(item, { reviewers?, lens?, threshold?, agent? })` | `{ ok, upheld, refuted, reviewers, threshold, votes }` — reviewers told to refute; `ok` when a majority (or `threshold`) did not |
+| `refine(generate, validate, { attempts? })` | `{ ok, value, attempts, feedback? }` — generate, validate, retry with the validator's feedback |
+| `checkpoint(prompt, { kind?, choices?, default?, timeoutMs? })` | The person's answer: a boolean (confirm), a choice (select) or text (input) — replayed on resume |
 
 A budget is a hard ceiling on the run's work tokens (input + output + cache writes of every child message — never the cached prefix read back on each turn, which pi's `totalTokens` includes and which would count it once per turn): once it is reached the next `agent()` throws, children already running finish, and the run ends as an error that says so. Scripts scale themselves with it — `while (budget.total && budget.remaining() > 50_000) { … }` — guarding on `total` so a run with no ceiling does not loop to the agent cap.
 
 `workflow(name, args)` runs `.pi/workflows/<name>.js` as a stage of the current script, so a reusable saved workflow composes instead of being pasted. Its agents are this run's agents: same list, same 20-agent cap, same concurrency semaphore, same cancel, same budget and same resume journal, so it can neither escape the limits nor hide from the record. A saved workflow cannot itself call `workflow()`.
+
+Four helpers encode the patterns the README used to leave to copy-paste. `loopUntilDry` is the discovery loop done right: items are deduplicated across rounds by `key` (default `JSON.stringify`), already-seen items never count as progress, and the loop ends after two dry rounds rather than only when the budget runs out — budget and agent-cap errors still propagate, nothing is swallowed. `verify` is the adversarial vote: each reviewer (an ordinary `agent()` call, so it counts against the cap and budget and replays on resume) is told to refute the claim and to default to refuted when unsure; `lens` gives each a different angle (`["correctness", "security", "reproduces"]`) instead of three identical skeptics. `refine` is generate → validate → retry: the validator returns `true`, or a string / `{ ok: false, feedback }` that the generator receives on the next attempt. `checkpoint` asks the person at the terminal mid-script — confirm, select or free text — and journals the reply by position, so a resume that reaches the same question replays the answer instead of asking again; a background or headless run cannot ask, so it takes the declared `default` or fails saying so, never a silent yes.
 
 `agent()` options: `agent`, `label`, `phase`, `gate`, `isolation`, `schema`. The script's return value becomes the tool result.
 

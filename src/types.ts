@@ -126,6 +126,8 @@ export interface WorkflowRun {
   resumedFrom?: string;
   /** Token ceiling the run started with, when it had one (v0.13). */
   budget?: number;
+  /** Replies to checkpoint() in call order, replayed by position on resume (v0.15). */
+  checkpoints?: Array<{ prompt: string; reply: unknown }>;
   background: boolean;
   status: RunStatus;
   startedAt: number;

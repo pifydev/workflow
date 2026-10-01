@@ -43,7 +43,34 @@ export interface SandboxHooks {
    * script: nesting is one level, so a saved workflow cannot call another.
    */
   workflow?(name: string, args: unknown): Promise<unknown>;
+  /**
+   * Ask a person mid-script. The host owns the dialog, the headless rule and
+   * the journal entry that lets a resume replay the reply instead of asking
+   * again. Absent when no host can ask.
+   */
+  checkpoint?(prompt: string, opts: CheckpointOptions): Promise<unknown>;
 }
+
+/** What a script may ask of a checkpoint. */
+export interface CheckpointOptions {
+  /** confirm (default): yes/no. select: one of `choices`. input: free text. */
+  kind?: "confirm" | "select" | "input";
+  choices?: string[];
+  placeholder?: string;
+  /** Taken when nobody can answer (headless, background, timeout, Esc on select/input). Without one those cases throw. */
+  default?: unknown;
+  timeoutMs?: number;
+}
+
+/** The verdict shape verify() asks each reviewer for. */
+const VERDICT_SCHEMA = {
+  type: "object",
+  properties: {
+    refuted: { type: "boolean" },
+    reasoning: { type: "string" },
+  },
+  required: ["refuted", "reasoning"],
+} as const;
 
 function poisonedMath(): Math {
   const clone = Object.create(Math) as Math;
@@ -171,6 +198,106 @@ export async function runScript(
     );
   };
 
+  /**
+   * Iterative discovery: run `round(n)` until `consecutiveEmpty` rounds in a
+   * row return nothing new (dedup by `key`, default JSON), or `maxRounds`.
+   * Errors — budget, agent cap, abort — propagate; this never swallows them.
+   */
+  const loopUntilDry = async (opts: unknown): Promise<unknown[]> => {
+    const o = (opts ?? {}) as { round?: unknown; key?: unknown; consecutiveEmpty?: unknown; maxRounds?: unknown };
+    if (typeof o.round !== "function") throw new Error("loopUntilDry() requires a round(n) function.");
+    const keyOf = typeof o.key === "function" ? (o.key as (item: unknown) => unknown) : (item: unknown) => JSON.stringify(item);
+    const consecutiveEmpty = Math.max(1, Math.floor(Number(o.consecutiveEmpty) || 2));
+    const maxRounds = Math.max(1, Math.floor(Number(o.maxRounds) || 50));
+    const seen = new Set<unknown>();
+    const all: unknown[] = [];
+    let empty = 0;
+    for (let n = 0; n < maxRounds; n++) {
+      const items = await (o.round as (n: number) => unknown)(n);
+      const fresh: unknown[] = [];
+      for (const item of Array.isArray(items) ? items : []) {
+        const k = keyOf(item);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        fresh.push(item);
+      }
+      all.push(...fresh);
+      if (fresh.length === 0) {
+        empty++;
+        if (empty >= consecutiveEmpty) break;
+      } else {
+        empty = 0;
+      }
+    }
+    return all;
+  };
+
+  /**
+   * Adversarial verification: N reviewers, each told to refute, majority
+   * (or `threshold`) of not-refuted wins. `lens` gives each reviewer a
+   * distinct angle instead of N identical skeptics. Reviewers are ordinary
+   * agent() calls — same cap, budget, journal and resume.
+   */
+  const verify = async (item: unknown, opts?: unknown): Promise<unknown> => {
+    const o = (opts ?? {}) as { reviewers?: unknown; threshold?: unknown; lens?: unknown; agent?: unknown; label?: unknown };
+    const lenses = Array.isArray(o.lens) ? o.lens.map(String) : null;
+    const reviewers = lenses ? lenses.length : Math.max(1, Math.floor(Number(o.reviewers) || 3));
+    const threshold = Math.max(1, Math.floor(Number(o.threshold) || Math.floor(reviewers / 2) + 1));
+    const text = typeof item === "string" ? item : JSON.stringify(item, null, 2);
+    const votes = await Promise.all(
+      Array.from({ length: reviewers }, (_, i) => {
+        const lens = lenses ? lenses[i] : null;
+        const prompt =
+          `Adversarially verify the claim below. Try to REFUTE it; default to refuted=true unless the evidence holds up under your own reading` +
+          (lens ? `, judging it through the ${lens} lens` : "") +
+          `. Answer with refuted (true/false) and your reasoning.\n\nCLAIM:\n${text}`;
+        return agent(prompt, {
+          ...(typeof o.agent === "string" ? { agent: o.agent } : {}),
+          label: `${typeof o.label === "string" ? o.label : "verify"}:${lens ?? i + 1}`,
+          schema: VERDICT_SCHEMA as unknown as Record<string, unknown>,
+        }).catch(() => null);
+      }),
+    );
+    const refuted = votes.filter((v) => v && (v as { refuted?: unknown }).refuted === true).length;
+    const upheld = votes.filter((v) => v && (v as { refuted?: unknown }).refuted === false).length;
+    return { ok: upheld >= threshold, upheld, refuted, reviewers, threshold, votes };
+  };
+
+  /**
+   * Generate → validate → retry with the validator's feedback, up to
+   * `attempts`. The validator returns true, or a string/{ok,feedback}
+   * explaining what to fix; the generator receives that feedback and the
+   * attempt index. The last value is returned either way, with `ok`.
+   */
+  const refine = async (generate: unknown, validate: unknown, opts?: unknown): Promise<unknown> => {
+    if (typeof generate !== "function" || typeof validate !== "function") {
+      throw new Error("refine() requires generate(feedback, attempt) and validate(value) functions.");
+    }
+    const attempts = Math.max(1, Math.floor(Number((opts as { attempts?: unknown } | undefined)?.attempts) || 3));
+    let feedback: string | null = null;
+    let value: unknown;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      value = await (generate as (feedback: string | null, attempt: number) => unknown)(feedback, attempt);
+      const verdict = await (validate as (value: unknown) => unknown)(value);
+      if (verdict === true || (verdict && typeof verdict === "object" && (verdict as { ok?: unknown }).ok === true)) {
+        return { ok: true, value, attempts: attempt + 1 };
+      }
+      feedback =
+        typeof verdict === "string"
+          ? verdict
+          : verdict && typeof verdict === "object" && typeof (verdict as { feedback?: unknown }).feedback === "string"
+            ? ((verdict as { feedback: string }).feedback as string)
+            : "rejected";
+    }
+    return { ok: false, value, attempts, feedback };
+  };
+
+  const checkpoint = (prompt: unknown, opts?: unknown): Promise<unknown> => {
+    if (typeof prompt !== "string" || !prompt.trim()) return Promise.reject(new Error("checkpoint() requires a prompt."));
+    if (!hooks.checkpoint) return Promise.reject(new Error("checkpoint() is not available here: no host can ask a person."));
+    return hooks.checkpoint(prompt, (opts ?? {}) as CheckpointOptions);
+  };
+
   const workflow = (name: unknown, nestedArgs?: unknown): Promise<unknown> => {
     if (typeof name !== "string" || !name.trim()) {
       return Promise.reject(new Error("workflow() requires a saved workflow name."));
@@ -187,6 +314,10 @@ export async function runScript(
       parallel,
       pipeline,
       workflow,
+      loopUntilDry,
+      verify,
+      refine,
+      checkpoint,
       phase: (title: unknown) => hooks.phase(String(title)),
       log: (message: unknown) => hooks.log(String(message)),
       args,

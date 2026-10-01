@@ -50,7 +50,14 @@ import {
   type Isolation, isolationPromptNote, repoToplevel } from "../src/isolate.ts";
 import { parseAgentFile } from "../src/frontmatter.ts";
 import { buildWidgetLines, formatResult, formatStatus } from "../src/report.ts";
-import { runScript, ScriptTimeoutError, UnsettledAgentsError, type AgentOptions, type SandboxHooks } from "../src/sandbox.ts";
+import {
+  runScript,
+  ScriptTimeoutError,
+  UnsettledAgentsError,
+  type AgentOptions,
+  type CheckpointOptions,
+  type SandboxHooks,
+} from "../src/sandbox.ts";
 import { BudgetExceededError, budgetView, formatBudget, parseBudget } from "../src/budget.ts";
 import { addChildSpend } from "../src/child-cost.ts";
 import { childTokens } from "../src/tokens.ts";
@@ -643,12 +650,43 @@ export default function workflow(pi: ExtensionAPI) {
 
   // ── Execution ────────────────────────────────────────────────────────
 
+  /**
+   * A checkpoint asks the person at the terminal. Foreground runs have one;
+   * a background or headless run does not, and then the declared default is
+   * taken — never a silent yes — or the script fails saying so.
+   */
+  async function askCheckpoint(ctx: UiContext, run: WorkflowRun, prompt: string, opts: CheckpointOptions): Promise<unknown> {
+    const fallback = (why: string): unknown => {
+      if ("default" in opts) return opts.default;
+      throw new Error(`checkpoint("${prompt.slice(0, 80)}") ${why} and no default was given.`);
+    };
+    if (!ctx.hasUI || run.background) return fallback("has no person to ask (headless or background run)");
+    const signal = typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? AbortSignal.timeout(opts.timeoutMs) : undefined;
+    if (opts.kind === "select") {
+      const choices = Array.isArray(opts.choices) ? opts.choices.map(String) : [];
+      if (choices.length === 0) throw new Error("checkpoint({kind:'select'}) needs choices.");
+      const picked = await withUiLock(() => ctx.ui.select(prompt, choices, { signal }));
+      return picked === undefined ? fallback("was dismissed or timed out") : picked;
+    }
+    if (opts.kind === "input") {
+      const text = await withUiLock(() => ctx.ui.input(prompt, opts.placeholder ?? "", { signal }));
+      return text === undefined ? fallback("was dismissed or timed out") : text;
+    }
+    if (signal) {
+      // confirm() reports Esc and a timeout alike as false; tell them apart so a timeout honours the default.
+      const answered = await withUiLock(() => ctx.ui.confirm("Workflow checkpoint", prompt, { signal }));
+      return signal.aborted ? fallback("timed out") : answered;
+    }
+    return withUiLock(() => ctx.ui.confirm("Workflow checkpoint", prompt));
+  }
+
   async function execute(
     ctx: UiContext,
     run: WorkflowRun,
     script: string,
     args: unknown,
     cursor: ResumeCursor | null = null,
+    priorCheckpoints: ReadonlyArray<{ prompt: string; reply: unknown }> = [],
   ): Promise<void> {
     // One ceiling and one call counter for the run, shared with anything a
     // nested workflow() starts: the nested script's agent() calls are simply
@@ -656,8 +694,26 @@ export default function workflow(pi: ExtensionAPI) {
     // same resume journal — so it cannot escape the limits or the record.
     const budget = budgetView(run.budget ?? null, () => run.agents.reduce((n, c) => n + c.tokens, 0));
     const counter = { calls: 0 };
+    run.checkpoints ??= [];
     const hooks = (nested: boolean): SandboxHooks => ({
       agent: (prompt, opts) => runChildAgent(ctx, run, cursor, prompt, opts),
+      // Journaled by position like agent calls: a resume whose i-th
+      // checkpoint asks the same question replays the prior reply.
+      checkpoint: async (prompt, opts) => {
+        const index = run.checkpoints!.length;
+        const prior = priorCheckpoints[index];
+        if (prior && prior.prompt === prompt) {
+          run.checkpoints!.push(prior);
+          run.logs.push(`checkpoint ${index + 1}: replayed from the prior run`);
+          renderWidget();
+          return prior.reply;
+        }
+        run.logs.push(`checkpoint ${index + 1}: ${prompt.slice(0, 120)}`);
+        renderWidget();
+        const reply = await askCheckpoint(ctx, run, prompt, opts);
+        run.checkpoints!.push({ prompt, reply });
+        return reply;
+      },
       log: (message) => {
         run.logs.push(message.slice(0, 500));
         renderWidget();
@@ -767,7 +823,12 @@ export default function workflow(pi: ExtensionAPI) {
       "budget=\"500k\" caps the run's total tokens (hard: agent() refuses once reached); the script sees " +
       "budget.total/spent()/remaining() and can scale itself with it. " +
       "workflow(name, args?) inside a script runs a saved workflow inline as one step (one level of nesting), " +
-      "sharing this run's agents, cap, cancel and budget.",
+      "sharing this run's agents, cap, cancel and budget. " +
+      "Reviewed helpers: loopUntilDry({round(n), key?, consecutiveEmpty?, maxRounds?}) keeps running rounds until N dry ones; " +
+      "verify(item, {reviewers|lens, threshold?}) = adversarial reviewer vote → {ok, upheld, refuted, votes}; " +
+      "refine(generate(feedback, attempt), validate(value), {attempts?}) = retry with the validator's feedback; " +
+      "checkpoint(prompt, {kind?: confirm|select|input, choices?, default?, timeoutMs?}) asks the user mid-script " +
+      "(replayed on resume; headless/background takes `default` or fails).",
     parameters: Type.Object({
       script: Type.Optional(Type.String({ description: "JavaScript orchestration script body" })),
       name: Type.Optional(Type.String({ description: "Saved workflow name in .pi/workflows/" })),
@@ -813,6 +874,7 @@ export default function workflow(pi: ExtensionAPI) {
       // v0.4 resume: rebuild the prior run's reusable prefix.
       let cursor: ResumeCursor | null = null;
       let cacheSize = 0;
+      let priorCheckpoints: ReadonlyArray<{ prompt: string; reply: unknown }> = [];
       const resumeId = params.resumeFromRunId?.trim();
       if (resumeId) {
         const prior = runs.get(resumeId);
@@ -824,6 +886,7 @@ export default function workflow(pi: ExtensionAPI) {
         const cache = buildCache(prior.agents);
         cacheSize = cache.length;
         cursor = new ResumeCursor(cache);
+        priorCheckpoints = prior.checkpoints ?? [];
       }
 
       runCounter++;
@@ -838,6 +901,7 @@ export default function workflow(pi: ExtensionAPI) {
         phases: [],
         agents: [],
         logs: [],
+        checkpoints: [],
         result: null,
         error: null,
       };
@@ -861,7 +925,7 @@ export default function workflow(pi: ExtensionAPI) {
       if (cursor) run.logs.push(`resume: ${cacheSize} cached agent result(s) available from ${resumeId}`);
 
       if (run.background) {
-        void execute(uiCtx, run, script, params.args, cursor)
+        void execute(uiCtx, run, script, params.args, cursor, priorCheckpoints)
           .then(() => {
             notify(uiCtx, `workflow ${run.runId}: ${run.status}`, run.status === "done" ? "info" : "warning");
             // The result goes to the agent, not only to the screen — otherwise
@@ -898,7 +962,7 @@ export default function workflow(pi: ExtensionAPI) {
       }
 
       try {
-        await execute(uiCtx, run, script, params.args, cursor);
+        await execute(uiCtx, run, script, params.args, cursor, priorCheckpoints);
       } finally {
         if (stopListening) stopListening();
       }
