@@ -63,6 +63,7 @@ import { addChildSpend } from "../src/child-cost.ts";
 import { childTokens } from "../src/tokens.ts";
 import { resolveChildModel } from "../src/child-model.ts";
 import { findPinnedModel } from "../src/model-match.ts";
+import { readDefaultModel } from "../src/default-model.ts";
 import { readStructured, retryPrompt, schemaInstruction } from "../src/schema.ts";
 import {
   AGENT_CONCURRENCY,
@@ -302,6 +303,27 @@ export default function workflow(pi: ExtensionAPI) {
   }
 
   /**
+   * The model a child defaults to when its definition pins none: the
+   * `defaultModel` of `pify-agents.json` (global, or the project's under the
+   * same approval as its agent definitions). Resolved like an agent file's
+   * pin; found or missed, each distinct outcome is said once per instance so
+   * the fan-out does not repeat it per child.
+   */
+  let defaultModelSaid: string | null = null;
+  async function fallbackModel(ctx: UiContext, who: string): Promise<UiContext["model"] | null> {
+    const found = readDefaultModel(getAgentDir(), ctx.cwd, await projectConsent(ctx, "agents", "its own agent definitions, which override the builtins of the same name", join(ctx.cwd, ".pi", "agents")));
+    if (!found) return null;
+    const pinned = findPinnedModel(ctx.modelRegistry, found.pin);
+    const key = `${found.file}\n${found.pin}\n${pinned.model ? pinned.model.id : pinned.reason}`;
+    if (defaultModelSaid !== key) {
+      defaultModelSaid = key;
+      if (pinned.model) notify(ctx, `workflow ${who}: no model pinned — children default to ${found.pin} (${found.file})`, "info");
+      else notify(ctx, `workflow ${who}: defaultModel in ${found.file}: ${pinned.reason} — using session model`, "warning");
+    }
+    return pinned.model;
+  }
+
+  /**
    * Stop a run and everything it started. Called from the tool's AbortSignal
    * and from session teardown; both need the children to actually stop, not
    * just the record to say so.
@@ -443,6 +465,9 @@ export default function workflow(pi: ExtensionAPI) {
           run.logs.push(`${call.label}: ${pinned.reason} — using session model`);
           notify(ctx, `workflow ${run.runId} ${call.label}: ${pinned.reason} — using session model`, "warning");
         }
+      } else {
+        // No pin of its own: the suite-wide defaultModel from pify-agents.json, if any.
+        model = (await fallbackModel(ctx, run.runId)) ?? model;
       }
       if (!model) throw new Error("No model available");
       // pi 0.99: a virtual selection cannot drive a child session (the fresh
