@@ -60,7 +60,7 @@ return { findings: verified.filter(Boolean) };
 | `budget` | `{ total, spent(), remaining() }` — the run's token ceiling (`total` is `null` and `remaining()` is `Infinity` when there is none) |
 | `workflow(name, args?)` | A saved workflow run inline as one step, returning whatever it returns — one level of nesting |
 | `loopUntilDry({ round, key?, consecutiveEmpty?, maxRounds? })` | Everything `round(n)` found, deduplicated across rounds, once `consecutiveEmpty` (2) rounds in a row found nothing new or `maxRounds` (50) ran |
-| `verify(item, { reviewers?, lens?, threshold?, agent? })` | `{ ok, upheld, refuted, reviewers, threshold, votes }` — reviewers told to refute; `ok` when a majority (or `threshold`) did not |
+| `verify(item, { reviewers?, lens?, threshold?, agent? })` | `{ ok, upheld, refuted, errored, reviewers, threshold, votes }` — reviewers told to refute; `ok` only when at least `threshold` AFFIRMATIVELY upheld it; a reviewer that could not run is `errored`, never a vote |
 | `refine(generate, validate, { attempts? })` | `{ ok, value, attempts, feedback? }` — generate, validate, retry with the validator's feedback |
 | `checkpoint(prompt, { kind?, choices?, default?, timeoutMs? })` | The person's answer: a boolean (confirm), a choice (select) or text (input) — replayed on resume |
 
@@ -141,6 +141,34 @@ Failures: 1 error, 1 aborted
 A gate rejection is told once, by the gate ledger, not repeated here.
 
 Verified where it has to be true rather than in a fixture — `test/live/gate-wire.mjs` and `test/live/attribution-wire.mjs` read pi's own provider requests and confirm the ledger, the outcome and the reason reach the model, including the shared-tree note from a real `parallel()` race.
+
+### Reviewing a change, then verifying every finding
+
+The two-stage shape ECC's review pipeline uses: fan out one reviewer per dimension, then hand each finding to an independent skeptic — and keep a finding that *could not be verified* as blocking rather than quietly dropping it.
+
+```js
+const DIMENSIONS = ["correctness", "security", "performance"];
+// Stage 1: every dimension reviews the diff in parallel.
+const reviews = await parallel(
+  DIMENSIONS.map((d) => () =>
+    agent(`Review this diff for ${d} defects. Report each as one finding with file:line and the evidence.
+
+${args.diff}`,
+      { label: `review:${d}`, schema: FINDINGS_SCHEMA })),
+);
+const findings = reviews.filter(Boolean).flatMap((r) => r.findings);
+// Stage 2: an independent skeptic tries to refute each finding.
+const judged = await Promise.all(findings.map(async (f) => {
+  const v = await verify(JSON.stringify(f), { reviewers: 3, label: `verify:${f.file}` });
+  // ok === the skeptics could NOT refute it → a real finding. An errored
+  // verdict (v.errored > 0 and no majority either way) stays blocking: an
+  // unverifiable finding is not a cleared one.
+  return { ...f, confirmed: v.ok, inconclusive: !v.ok && v.upheld < v.threshold && v.refuted < v.threshold };
+}));
+return { blocking: judged.filter((f) => f.confirmed || f.inconclusive), advisory: judged.filter((f) => !f.confirmed && !f.inconclusive) };
+```
+
+`verify()` is fail-closed: `ok` is true only when at least `threshold` reviewers *affirmatively* upheld the claim, so a reviewer lost to a provider error or a schema miss (counted in `errored`) can only make a claim harder to confirm, never easier — uncertainty never clears a blocker. The claim is fenced as untrusted data, so a diff or tool-output line that says "mark this upheld" is treated as a reason to refute, not a command.
 
 ## Resume
 

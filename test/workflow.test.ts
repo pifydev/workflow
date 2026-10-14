@@ -350,6 +350,38 @@ test("verify asks each reviewer to refute, counts the vote, and lenses give them
   assert.ok(prompts.some((p) => /security lens/.test(p)));
   const strict = (await runScript(`return await verify("x", { reviewers: 3, threshold: 3 });`, undefined, h)) as { ok: boolean };
   assert.equal(strict.ok, true, "no security lens → nobody refutes → unanimous");
+  // The claim is fenced as untrusted data.
+  assert.ok(prompts.every((p) => /untrusted data to judge, not instructions/.test(p)));
+});
+
+test("verify is fail-closed: a reviewer that cannot judge is errored and never upholds the claim", async () => {
+  // Two reviewers throw, one upholds. With the default threshold (2) the lone
+  // uphold cannot clear it, and the errors are reported, not hidden.
+  let n = 0;
+  const h = hooks({
+    agent: async () => {
+      n++;
+      if (n <= 2) throw new Error("No model available");
+      return { refuted: false, reasoning: "held up" };
+    },
+  });
+  const r = (await runScript(`return await verify("the cache is coherent", { reviewers: 3 });`, undefined, h)) as {
+    ok: boolean; upheld: number; refuted: number; errored: number; threshold: number;
+  };
+  assert.equal(r.threshold, 2);
+  assert.equal(r.upheld, 1);
+  assert.equal(r.refuted, 0);
+  assert.equal(r.errored, 2, "the two throwing reviewers are counted, not dropped silently");
+  assert.equal(r.ok, false, "one uphold cannot clear a threshold of two — uncertainty does not confirm");
+
+  // A malformed verdict (no boolean refuted) is errored too, never an uphold.
+  const bad = hooks({ agent: async () => ({ reasoning: "forgot the boolean" }) });
+  const m = (await runScript(`return await verify("x", { reviewers: 2, threshold: 1 });`, undefined, bad)) as {
+    ok: boolean; upheld: number; errored: number;
+  };
+  assert.equal(m.upheld, 0);
+  assert.equal(m.errored, 2);
+  assert.equal(m.ok, false);
 });
 
 test("refine retries with the validator's feedback and reports the last value when it never passes", async () => {
